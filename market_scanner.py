@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY OI-first analytical scanner v120.1.0 — single-file production candidate.
+"""NIFTY OI-first analytical scanner v120.2.0 — single-file production candidate.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independent setup watches -> fixed risk plan -> one quoted option contract ->
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '120.1.0'
+__version__ = '120.2.0'
 
 
 # scanner/core.py
@@ -97,7 +97,7 @@ class Config:
     acceptance_buffer_atr: float = 0.12
     max_target_projection_atr: float = 4.0
     one_itm_execution_tolerance: float = 0.06
-    # v120.1: session-wide, independent price-action level tests. All values
+    # v120.2: session-wide, independent price-action level tests. All values
     # are deterministic engineering thresholds; no statistically fitted edge.
     level_zone_atr: float = 0.28
     level_reset_atr: float = 0.65
@@ -125,7 +125,7 @@ class Config:
     last_minute_dispatch_buffer: float = 3.0
     minimum_entry_to_exit_minutes: float = 8.0
     reversal_short_window_bars: int = 3
-    # v120.1: closed-price early discovery, impulse exhaustion and episode integrity.
+    # v120.2: closed-price early discovery, impulse exhaustion and episode integrity.
     # Fixed engineering thresholds, not back-tested profitability estimates.
     early_recovery_body_atr: float = 0.18
     early_recovery_change_atr: float = 0.18
@@ -2346,7 +2346,7 @@ def migrate_state(source, destination, now):
     if schema in (1,2,3,4,5,6,7):
         state=load(source,allow_legacy=True)
         preserve_intraday_oi=(schema in (5,6,7))
-        state.update(schema=7,engine_version='120.1.0',thesis=None,setup_watches=[],
+        state.update(schema=7,engine_version='120.2.0',thesis=None,setup_watches=[],
                      opportunity_journal=[],futures_snapshot=None,price_action_ledger={},market_phase={})
         if not preserve_intraday_oi:
             state.update(oi_snapshot=None,oi_history=[],session_oi_baseline=None)
@@ -2361,7 +2361,7 @@ def migrate_state(source, destination, now):
     elif legacy.get('schema_version') in (107,109):
         if legacy.get('position_reconciliation_required'):
             raise StateError('Legacy state requires reconciliation; it cannot be migrated as flat')
-        state={'schema':7,'engine_version':'120.1.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
+        state={'schema':7,'engine_version':'120.2.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[],'opportunity_journal':[]}
         original=legacy.get('active_position')
@@ -2483,31 +2483,51 @@ def load(path: Path, allow_legacy=False):
     if not allow_legacy:
         if state.get('entry_quality_revision') not in (1191, 1192):
             raise StateError('SCHEMA7_PREVIOUS_STATE_REQUIRES_OPERATOR_MIGRATION: do not copy an older state in place')
-        state['schema']=7;state['engine_version']='120.1.0'
+        state['schema']=7;state['engine_version']='120.2.0'
     return state
 
 
 def initialize(path: Path, now: datetime):
     if path.exists():raise StateError('State already exists; refusing to overwrite')
-    save(path,{'schema':7,'engine_version':'120.1.0','initialized_at':now.isoformat(),'initialized_flat':True,'entry_quality_revision':1192,'session_date':None,
+    save(path,{'schema':7,'engine_version':'120.2.0','initialized_at':now.isoformat(),'initialized_flat':True,'entry_quality_revision':1192,'session_date':None,
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[],'opportunity_journal':[]})
 
 
+# Only qualified entries and actionable position lifecycle events are emailed.
+# Observational watches and conditional triggers are intentionally excluded.
+DELIVERABLE_KINDS = frozenset({
+    'ENTRY', 'TARGET_1', 'EXIT', 'STOP_RATCHET',
+    'REFERENCE_POSITION_EXPIRED_UNVERIFIED',
+})
+RECORDABLE_NONDELIVERABLE_KINDS = frozenset({'LEGACY_NOTIFICATION_REVIEW_REQUIRED'})
+
 def queue(state: dict, kind: str, details: dict, when: datetime):
-    raw = json.dumps([kind, details], sort_keys=True, separators=(',', ':'), allow_nan=False)
+    """Idempotent durable outbox event keyed to the recorded event itself.
+
+    A T2 or stop-loss is sent as EXIT with an explicit exit reason, not as a
+    fabricated independent trade. This handles a stop after T1 in the same
+    completed one-minute candle without losing either observation.
+    """
+    raw = json.dumps([kind, details], sort_keys=True,
+                     separators=(',', ':'), allow_nan=False)
     event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
-    if kind != 'ENTRY':
-        return event_id  # non-entry is always captured in audit, never emailed
-    if not any((x['id'] == event_id for x in state['outbox'])):
-        state['outbox'].append({'id': event_id, 'kind': kind, 'created_at': when.isoformat(), 'details': copy.deepcopy(details), 'status': 'PENDING', 'claim': None})
+    if kind not in DELIVERABLE_KINDS | RECORDABLE_NONDELIVERABLE_KINDS:
+        return event_id
+    if not any(x['id'] == event_id for x in state['outbox']):
+        state['outbox'].append({
+            'id': event_id, 'kind': kind, 'created_at': when.isoformat(),
+            'details': copy.deepcopy(details), 'status': 'PENDING', 'claim': None,
+        })
     return event_id
 
 def claim(state: dict, token: str, now=None):
+    """Claim only actionable notifications; persist claims before SMTP."""
     if not token or len(token) > 160:
         raise StateError('Notification claim token required')
     for event in state['outbox']:
-        if event['status'] == 'PENDING' and event.get('kind') == 'ENTRY':
+        if (event['status'] == 'PENDING'
+                and event.get('kind') in DELIVERABLE_KINDS):
             if now and (now - datetime.fromisoformat(event['created_at'])).total_seconds() > 8 * 60:
                 event['delayed_delivery'] = True
             event.update(status='CLAIMED', claim=token)
@@ -3493,7 +3513,7 @@ def add_phase_to_forecast(result: dict, market_phase: dict) -> None:
         forecast['entry_readiness']='INDEPENDENT_VALIDATED_REACTION_REQUIRED'
 
 # ============================================================================
-# v120.1 OI-FIRST CAUSAL MARKET ENGINE -- embedded in this single production file
+# v120.2 OI-FIRST CAUSAL MARKET ENGINE -- embedded in this single production file
 # ============================================================================
 # The PE/CE options open-interest concentration defines *candidate* price
 # barriers. Completed price reactions determine which ones are defended,
@@ -3536,8 +3556,14 @@ def v1201_three_direction(bars: list[Candle], direction: str, a: float) -> bool:
     if not threes:
         return False
     latest = threes[-1]
-    if latest.start + timedelta(minutes=3) < bars[-1].start:
-        return False  # stale completed 3m context
+    # The latest closed 3m candle is valid for the NEXT two closed 1m bars
+    # while the next 3m candle is forming. Earlier v120.1 logic mistakenly
+    # discarded that completed 3m context before a new one was available.
+    three_closed_at = latest.start + timedelta(minutes=3)
+    latest_one_closed_at = bars[-1].start + timedelta(minutes=1)
+    age = latest_one_closed_at - three_closed_at
+    if age < timedelta(0) or age > timedelta(minutes=3):
+        return False  # incomplete or genuinely stale completed 3m context
     sign = 1 if direction == 'BULLISH' else -1
     return (sign * (latest.close - latest.open) >= 0.12 * a
             or (len(threes) >= 2 and
@@ -3589,13 +3615,31 @@ def v1201_zone_book(chain: list[dict], bars: list[Candle], spot: float,
     changes = {(r['side'], float(r['strike'])): r.get('oi_change')
                for r in (oi_context_live or {}).get('walls', [])
                if r.get('side') in ('CE', 'PE') and r.get('strike') is not None}
+    # Only identity-matched live OI comparisons are eligible. Do not backdate
+    # a later chain snapshot to an earlier completed candle.
+    for row in (oi_context_live or {}).get('all_matched_oi_changes', []):
+        try:
+            if row.get('side') in ('CE', 'PE') and row.get('strike') is not None:
+                changes[(row['side'], float(row['strike']))] = row.get('oi_change')
+        except (ValueError, TypeError):
+            continue
     zones = []
     for r in near:
         side = r['side']
         strike = float(r['strike'])
         strength = float(r['oi']) / peak[side] if peak[side] else 0.
         # Preserve nearby secondary CE/PE OI walls even if not the side peak.
-        threshold = min(0.50, config.min_wall_fraction) if abs(strike - spot) <= half else config.min_wall_fraction
+        # Near-term PE levels with observed 1m interaction are still valid
+        # evidence at 40–65% of the side peak. An opposing Call-OI barrier
+        # cannot disappear solely for being 63% instead of 65% of the peak.
+        recent_interaction = any(c.low <= strike + half and c.high >= strike - half
+                                 for c in bars[-5:])
+        if (recent_interaction and abs(strike - spot) <= half + max(a, 3.0)):
+            threshold = min(0.38, config.min_wall_fraction)
+        elif abs(strike - spot) <= config.strike_step + half:
+            threshold = min(0.55, config.min_wall_fraction)
+        else:
+            threshold = config.min_wall_fraction
         if strength < threshold:
             continue
         low, high = strike - half, strike + half
@@ -3608,7 +3652,12 @@ def v1201_zone_book(chain: list[dict], bars: list[Candle], spot: float,
         rejection = bool(side == 'CE' and visited_ce and not accepted_above
                          and v1201_price_alignment(bars, 'BEARISH', a)
                          and max(c.high for c in recent[-9:]) - bars[-1].close >= .60 * a)
+        # A put wall breached below its LOW edge is not current support.
+        # A temporary 3m bounce below it cannot be a new CE entry. Require
+        # both the completed 1m close and the live reference to hold the zone.
         defense = bool(side == 'PE' and visited_pe and not accepted_below
+                       and spot >= low + max(.25, .06 * a)
+                       and bars[-1].close >= low + max(.25, .06 * a)
                        and v1201_price_alignment(bars, 'BULLISH', a)
                        and bars[-1].close - min(c.low for c in recent[-9:]) >= .60 * a)
         zones.append(OIZone1201(
@@ -3665,7 +3714,8 @@ def v1201_obstruction(direction: str, spot: float,
 
 def v1201_gate(direction: str, spot: float, bars: list[Candle],
               zones: list[OIZone1201], stop: float,
-              protected: str, config: Config) -> tuple[bool, str, dict]:
+              protected: str, config: Config,
+              setup_kind: str = '') -> tuple[bool, str, dict]:
     """Hard pre-trade OI opposition, quote and unreset-impulse checks."""
     if direction not in ('BULLISH', 'BEARISH') or len(bars) < config.min_bars:
         return False, 'OI_ZONE_INPUTS_INSUFFICIENT', {}
@@ -3683,10 +3733,17 @@ def v1201_gate(direction: str, spot: float, bars: list[Candle],
                         config.quote_adverse_risk_fraction * risk)
     if adverse > adverse_limit:
         return False, 'OI_ZONE_QUOTE_REVERSED_FROM_TRIGGER', details
+    # Quotes below the last completed bar's low cannot validate a fresh CE
+    # support-defense; the 14:12 spot was below the bullish-watch bar itself.
+    if direction == 'BULLISH' and spot < bars[-1].low - .10 * a:
+        return False, 'CE_LIVE_QUOTE_BELOW_COMPLETED_1M_LOW', details
+    if direction == 'BEARISH' and spot > bars[-1].high + .10 * a:
+        return False, 'PE_LIVE_QUOTE_ABOVE_COMPLETED_1M_HIGH', details
     early_rejection = bool(direction == 'BEARISH' and
                            any(z.side == 'CE' and z.rejection for z in zones))
     chase_limit = max(config.quote_chase_atr * a,
-                      1.25 * a if early_rejection else 0.)
+                      1.25 * a if early_rejection else 0.,
+                      1.20 * a if setup_kind == 'OI_ZONE_SUPPORT_RECLAIM' else 0.)
     if sign * (spot - bars[-1].close) > chase_limit:
         return False, 'OI_ZONE_LIVE_QUOTE_CHASING', details
     for z in zones:
@@ -3741,6 +3798,43 @@ def v1201_candidate_stop(direction: str, kind: str,
     return technical
 
 
+def v1202_countertrend_gate(direction: str, setup_kind: str,
+                            spot: float, bars: list[Candle],
+                            structure: dict, zone: OIZone1201,
+                            config: Config) -> tuple[bool, str]:
+    """Prevent PE-zone bounces from becoming premature bullish reversals.
+
+    A defended bearish trend does not flip to bullish after one opposite 3m
+    candle. Only a fresh *OI-level reclaim* may be traded tactically before
+    the broader reversal is confirmed; it needs completed 1m evidence, an
+    already closed bullish 3m, and a live quote beyond the zone's upper edge.
+    This does not weaken the separate same-strike CE rejection (early PE) path.
+    """
+    protected = structure.get('direction')
+    if direction != 'BULLISH' or protected != 'BEARISH':
+        return True, 'WITH_OR_SEPARATE_FROM_PROTECTED_TREND'
+    if setup_kind != 'OI_ZONE_SUPPORT_RECLAIM':
+        return False, 'BEARISH_PROTECTED_THESIS_REQUIRES_NEW_OI_RECLAIM'
+    if zone.side != 'PE' or zone.accepted_below or spot < zone.high:
+        return False, 'PUT_OI_ZONE_NOT_RECLAIMED'
+    latest = bars[-1]
+    a = max(1., atr(bars))
+    if latest.close - latest.open < .25 * a:
+        return False, 'COUNTERTREND_LAST_COMPLETED_1M_NOT_BULLISH'
+    if spot < latest.high - .12 * a:
+        return False, 'COUNTERTREND_QUOTE_DID_NOT_RECLAIM_1M_HIGH'
+    if not v1201_price_alignment(bars, 'BULLISH', a):
+        return False, 'COUNTERTREND_COMPLETED_1M_3M_NOT_ALIGNED'
+    # Price must have actually visited this PE level during the most recent
+    # 3-minute scan interval, rather than merely being near an OI strike.
+    if not any(c.low <= zone.high and c.high >= zone.low for c in bars[-3:]):
+        return False, 'COUNTERTREND_NO_RECENT_PUT_OI_PRICE_TEST'
+    if zone.delta_oi is not None and zone.oi > 0:
+        if zone.delta_oi / zone.oi < -.035:
+            return False, 'COUNTERTREND_PUT_OI_SUPPORT_UNWINDING_SEVERE'
+    return True, 'OI_ZONE_RECLAIM_WITH_CLOSED_1M_AND_3M'
+
+
 def v1201_setup_candidates(chain: list[dict], bars: list[Candle],
                            spot: float, oi_live: dict, structure: dict,
                            config: Config) -> tuple[list[dict], list[OIZone1201], list[dict]]:
@@ -3786,7 +3880,16 @@ def v1201_setup_candidates(chain: list[dict], bars: list[Candle],
                     else:
                         continue
                 else:
-                    if z.side == 'PE' and z.defense:
+                    if (z.side == 'PE' and protected == 'BEARISH'
+                          and not z.accepted_below and spot >= z.high
+                          and any(c.low <= z.high and c.high >= z.low
+                                  for c in prefix[-3:])
+                          and (prefix[-1].close - prefix[-1].open) >= .25 * a):
+                        # Bullish tactical reversal must reaccept a *tested*
+                        # PE support zone; a generic PE defense is insufficient
+                        # against the established bearish protected thesis.
+                        kind = 'OI_ZONE_SUPPORT_RECLAIM'
+                    elif z.side == 'PE' and z.defense:
                         kind = 'OI_ZONE_SUPPORT_DEFENSE'
                     elif z.side == 'CE' and z.accepted_above and spot > z.high:
                         kind = 'OI_ZONE_RESISTANCE_ACCEPTANCE'
@@ -3799,17 +3902,27 @@ def v1201_setup_candidates(chain: list[dict], bars: list[Candle],
                         kind = 'OI_ZONE_BULLISH_RETEST_CONTINUATION'
                     else:
                         continue
-                if kind in ('OI_ZONE_SUPPORT_DEFENSE', 'OI_ZONE_RESISTANCE_REJECTION'):
+                if kind in ('OI_ZONE_SUPPORT_DEFENSE', 'OI_ZONE_RESISTANCE_REJECTION',
+                            'OI_ZONE_SUPPORT_RECLAIM'):
                     # Entry must arise from an actual recent test, not hours-old OI.
                     interaction_window = prefix[-4:]
                     if not any(c.low <= z.high and c.high >= z.low for c in interaction_window):
                         continue
+                counter_ok, counter_reason = v1202_countertrend_gate(
+                    direction, kind, spot, bars, structure, z, config)
+                if not counter_ok:
+                    details.append({'kind': kind, 'direction': direction,
+                                    'level': z.strike, 'reason': counter_reason,
+                                    'price_trigger_completed_at':
+                                    (prefix[-1].start + timedelta(minutes=1)).isoformat()})
+                    continue
                 stop = v1201_candidate_stop(direction, kind, prefix, z, config)
                 if any(sign * (c.low - stop) <= 0 if sign > 0 else
                        sign * (c.high - stop) <= 0 for c in bars[len(prefix):]):
                     continue
                 allowed, reason, diag = v1201_gate(
-                    direction, spot, bars, zones, stop, protected, config)
+                    direction, spot, bars, zones, stop, protected, config,
+                    setup_kind=kind)
                 details.append({'kind': kind, 'direction': direction,
                                 'level': z.strike, 'reason': reason,
                                 'evaluation': diag,
@@ -3851,6 +3964,7 @@ def v1201_setup_candidates(chain: list[dict], bars: list[Candle],
                                  'STRUCTURAL_STOP_WITHOUT_RISK_COMPRESSION'],
                 })
     ranking = {'OI_ZONE_RESISTANCE_REJECTION': 0, 'OI_ZONE_SUPPORT_DEFENSE': 0,
+               'OI_ZONE_SUPPORT_RECLAIM': 0,
                'OI_ZONE_SUPPORT_ACCEPTANCE': 1, 'OI_ZONE_RESISTANCE_ACCEPTANCE': 1,
                'OI_ZONE_BEARISH_RETEST_CONTINUATION': 2,
                'OI_ZONE_BULLISH_RETEST_CONTINUATION': 2}
@@ -4293,6 +4407,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         price_ledger,market_phase,active_levels=publish_price_action_state(
             state,result,bars,thesis,config,spot,previous_day)
         context = enrich_oi_context(oi_context(chain, spot, config), result['oi_flow_context'], bars, spot, config=config, price_ledger=price_ledger)
+        context['all_matched_oi_changes'] = (result['oi_flow_context'].get('nearby_changes') or [])
         # Entry decisions need active zones, not the complete all-day anchor
         # inventory; the full ledger was already replayed causally above.
         context['price_action_ledger']={
@@ -4316,7 +4431,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         result['forecast'] = forecast_market(bars, thesis, spot, context, result.get('futures'), config)
         add_phase_to_forecast(result,market_phase)
         evidence.update(candles=[[c.start.isoformat(), c.open, c.high, c.low, c.close, c.volume] for c in bars], quotes=full, evaluated_at=now.isoformat())
-        # v120.1: OI concentration defines zones; completed price proves
+        # v120.2: OI concentration defines zones; completed price proves
         # rejection, defense or acceptance. Legacy watch paths do not run.
         state['setup_watches'] = []
         state['last_setup_candle'] = bars[-1].start.isoformat()
@@ -4377,7 +4492,8 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
                 evaluated.append(row)
                 continue
             scenario = ('REVERSAL' if setup['kind'] in (
-                'OI_ZONE_RESISTANCE_REJECTION', 'OI_ZONE_SUPPORT_DEFENSE')
+                'OI_ZONE_RESISTANCE_REJECTION', 'OI_ZONE_SUPPORT_DEFENSE',
+                'OI_ZONE_SUPPORT_RECLAIM')
                 else 'TREND_ACCEPTANCE')
             contract, rejected = select_contract(
                 chain, full, direction, scenario, spot, now, expiry,
@@ -4536,16 +4652,39 @@ from pathlib import Path
 def paths():
     return (Path(os.environ.get('STATE_FILE', 'state/market_state_v119_2.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
 
+def alert_label(event: dict) -> str:
+    """Clear user-facing label; no broker fill is asserted."""
+    kind = event.get('kind')
+    if kind == 'ENTRY':
+        return 'QUALIFIED STRIKE ENTRY'
+    if kind == 'TARGET_1':
+        return 'TARGET 1 REACHED'
+    if kind == 'STOP_RATCHET':
+        return 'STOP LOSS UPDATED'
+    if kind == 'EXIT':
+        reason = str((event.get('details') or {}).get('reason') or '')
+        if reason == 'TARGET_2_TOUCHED':
+            return 'TARGET 2 REACHED — EXIT'
+        if reason in {'STOP_TOUCHED', 'POST_T1_STOP_POSSIBLE_SAME_CANDLE',
+                      'PREMIUM_LOSS_GUARD', 'RUNNER_PREMIUM_DRAWDOWN'} or 'STOP' in reason:
+            return 'STOP LOSS TRIGGERED — EXIT'
+        return 'POSITION EXIT — ' + reason.replace('_', ' ')
+    if kind == 'REFERENCE_POSITION_EXPIRED_UNVERIFIED':
+        return 'UNVERIFIED POSITION EXPIRY — BROKER CHECK REQUIRED'
+    return str(kind).replace('_', ' ')
+
 def alert_text(event):
     d = event['details']
     p = d.get('position') or d.get('position_context') or {}
     contract = d.get('contract') or p
-    lines = ['NIFTY ' + event['kind'].replace('_', ' '), 'Original observation: ' + event['created_at']]
+    lines = ['NIFTY ' + alert_label(event), 'Original observation: ' + event['created_at']]
     if contract.get('side'):
         lines.append(f"Contract: {contract.get('strike')} {contract['side']} | Expiry {contract.get('expiry')}")
     for field, label in [('entry_spot', 'NIFTY entry reference'), ('entry_ask', 'Option ask reference'), ('stop', 'NIFTY stop'), ('t1', 'NIFTY target 1'), ('t2', 'NIFTY target 2'), ('remaining_pct', 'Remaining position %')]:
         if p.get(field) is not None:
             lines.append(f'{label}: {p[field]}')
+    if d.get('position_id') is not None:
+        lines.append('Reference position ID: ' + str(d['position_id']))
     if d.get('new_stop') is not None:
         lines.append('Updated NIFTY stop: ' + str(d['new_stop']))
     reason = d.get('reason') or d.get('cause')
@@ -4583,6 +4722,8 @@ def alert_text(event):
     sensitivity = (p.get('contract') or {}).get('plan_sensitivity') or {}
     if sensitivity.get('status') == 'LOCAL_SENSITIVITY_ESTIMATE':
         lines.append('Modelled option bid at underlying T1: ' + str(round(sensitivity['estimated_bid_at_underlying_t1'], 2)) + ' (unchanged-IV/Greeks approximation)')
+    if event.get('kind') == 'TARGET_1' and d.get('reference_spot') is not None:
+        lines.append('T1 underlying reference: ' + str(d['reference_spot']))
     if d.get('reference_spot') is not None:
         lines.append('NIFTY at detection/interval reference: ' + str(d['reference_spot']))
     if d.get('detected_at'):
@@ -4599,6 +4740,13 @@ def alert_text(event):
     return '\n'.join(lines)
 
 def deliver(s: dict, path: Path, token: str):
+    """Deliver claimed entry, T1, T2/SL exit and stop-update notifications.
+
+    Every SMTP attempt is persisted to the same durable state. After a
+    possibly successful send with an uncertain acknowledgement, status becomes
+    DELIVERY_UNCERTAIN; automatic replay cannot send a duplicate. Operators
+    can explicitly requeue after verifying non-delivery.
+    """
     sender = os.environ.get('EMAIL_SENDER', '')
     receiver = os.environ.get('EMAIL_RECEIVER', '')
     username = os.environ.get('EMAIL_USERNAME') or sender
@@ -4607,34 +4755,43 @@ def deliver(s: dict, path: Path, token: str):
     port = int(os.environ.get('SMTP_PORT', '465'))
     if not token:
         raise StateError('Notification claim token missing')
-    if not any((e.get('kind') == 'ENTRY' and e.get('status') == 'CLAIMED' and e.get('claim') == token for e in s['outbox'])):
+    pending = [event for event in s['outbox']
+               if event.get('kind') in DELIVERABLE_KINDS
+               and event.get('status') == 'CLAIMED'
+               and event.get('claim') == token]
+    if not pending:
         return 0
     if not all((sender, receiver, username, password, token)):
         raise StateError('Email credentials or claim token missing')
     uncertain = False
-    for event in s['outbox']:
-        if event.get('kind') != 'ENTRY' or event.get('status') != 'CLAIMED' or event.get('claim') != token:
-            continue
-        label = 'HISTORICAL ' if event.get('delayed_delivery') else 'RETRIED ' if event.get('manually_requeued_at') else ''
+    for event in pending:
+        label = ('HISTORICAL ' if event.get('delayed_delivery') else
+                 'RETRIED ' if event.get('manually_requeued_at') else '')
         msg = EmailMessage()
-        msg['Subject'] = 'NIFTY scanner: ' + label + event['kind']
+        msg['Subject'] = 'NIFTY scanner: ' + label + alert_label(event)
         msg['From'] = sender
         msg['To'] = receiver
         msg['Message-ID'] = '<' + event['id'] + '@nifty-scanner.local>'
         msg.set_content(alert_text(event))
         try:
             event['delivery_stage'] = 'CONNECT'
-            with smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context()) as smtp:
+            # Persist an explicit in-flight state before network I/O. A
+            # crash here prevents silent auto-resending of an ambiguous mail.
+            event['attempted_at'] = datetime.now(IST).isoformat()
+            event['status'] = 'DELIVERY_UNCERTAIN'
+            save(path, s)
+            with smtplib.SMTP_SSL(host, port, timeout=20,
+                                 context=ssl.create_default_context()) as smtp:
                 event['delivery_stage'] = 'AUTHENTICATE'
                 smtp.login(username, password)
                 event['delivery_stage'] = 'SEND'
                 smtp.send_message(msg)
             event['status'] = 'SENT'
             event['sent_at'] = datetime.now(IST).isoformat()
+            event.pop('error_type', None)
         except (OSError, smtplib.SMTPException) as exc:
-            event['status'] = 'DELIVERY_UNCERTAIN'
-            event['attempted_at'] = datetime.now(IST).isoformat()
             uncertain = True
+            event['status'] = 'DELIVERY_UNCERTAIN'
             event['error_type'] = type(exc).__name__
         save(path, s)
     return 1 if uncertain else 0
@@ -4684,8 +4841,8 @@ def main():
                 return 0
             if args.requeue_alert:
                 event = next((x for x in state['outbox'] if x.get('id') == args.requeue_alert), None)
-                if not event or event.get('kind') != 'ENTRY' or event.get('status') not in {'CLAIMED', 'DELIVERY_UNCERTAIN'}:
-                    raise StateError('Alert ID is not an uncertain or previously claimed alert')
+                if not event or event.get('kind') not in DELIVERABLE_KINDS or event.get('status') not in {'CLAIMED', 'DELIVERY_UNCERTAIN'}:
+                    raise StateError('Alert ID is not a claimed or uncertain actionable alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
                 append_audit(audit_dir / ('market_scan_v119_2_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
