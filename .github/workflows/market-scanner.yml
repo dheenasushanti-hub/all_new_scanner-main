@@ -1,4 +1,4 @@
-name: NIFTY OI-first scanner v120.1.0 (external dispatcher)
+name: NIFTY OI-first scanner v120.2.0 (external dispatcher)
 
 on:
   workflow_dispatch:
@@ -78,7 +78,7 @@ jobs:
         env:
           POSITION_ID: ${{ inputs.position_id }}
         run: python market_scanner.py --reconcile-flat "$POSITION_ID"
-      - name: Requeue a manually verified undelivered ENTRY email
+      - name: Requeue a manually verified undelivered actionable alert
         if: ${{ inputs.operation == 'requeue_alert' || inputs.requeue_signal_key != '' }}
         env:
           ALERT_ID: ${{ inputs.alert_id }}
@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           python market_scanner.py --requeue-alert "${ALERT_ID:-$LEGACY_ALERT_ID}"
-      - name: Run standalone v120.1 OI-first scanner and claim qualified entries
+      - name: Run standalone v120.2 OI-first scanner and claim trade lifecycle alerts
         id: scan
         if: ${{ inputs.operation == 'scan' || inputs.operation == '' }}
         env:
@@ -115,7 +115,7 @@ jobs:
           files=(audit/market_scan_v119_2_*.jsonl audit/worker_v119_2_*.log)
           if (( ${#files[@]} )); then git add -f -- "${files[@]}"; fi
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v120.1 state, recorded inputs and entry claims'
+            git commit -m 'Persist NIFTY v120.2 state, recorded inputs and alert claims'
             # Fail closed on concurrent branch updates. A rebase conflict leaves this
             # step failed, so claimed notifications are not delivered from state that
             # was not durably persisted to the default branch.
@@ -123,9 +123,9 @@ jobs:
             git rebase "origin/${DEFAULT_BRANCH}"
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
-      - name: Deliver only durably claimed qualified strike selections
+      - name: Deliver durably claimed entries, targets, stops and exits
         id: deliver
-        if: ${{ always() && steps.persist.outcome == 'success' && steps.scan.outcome == 'success' }}
+        if: ${{ always() && steps.persist.outcome == 'success' && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure') }}
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
@@ -136,8 +136,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f state/market_state_v119_2.json ]]; then
-            echo 'No existing schema-7 state file exists; skipping delivery.'
-            exit 0
+            echo 'CRITICAL: required schema-7 state file is missing; lifecycle alerts cannot be delivered.' >&2
+            exit 1
           fi
           if ! python - <<'PY'
           from pathlib import Path
@@ -147,11 +147,11 @@ jobs:
           try:
               scanner.load(Path('state/market_state_v119_2.json'))
           except Exception as exc:
-              print(f'v120.1 state is not readable; skipping delivery: {type(exc).__name__}')
+              print(f'CRITICAL: v120.2 state is unreadable; alert delivery failed: {type(exc).__name__}')
               raise SystemExit(1)
           PY
           then
-            exit 0
+            exit 1
           fi
           python market_scanner.py --deliver-claimed
       - name: Persist delivery outcome
@@ -167,7 +167,7 @@ jobs:
           fi
           git add -f -- state/market_state_v119_2.json
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v120.1 qualified selection email outcome'
+            git commit -m 'Persist NIFTY v120.2 entry, target and exit delivery outcomes'
             git fetch origin "${DEFAULT_BRANCH}"
             git rebase "origin/${DEFAULT_BRANCH}"
             git push origin "HEAD:${DEFAULT_BRANCH}"
