@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""NIFTY OI-first analytical scanner v120.2.0 — single-file production candidate.
+"""NIFTY OI-first analytical scanner v120.3.0 — single-file production candidate.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
-independent setup watches -> fixed risk plan -> one quoted option contract ->
+independently revalidated eight-minute watches -> fixed risk plan -> one quoted option contract ->
 chronological position management -> durable state and notification claims.
 
 Python 3.11+ standard library only. Configuration is environment-backed. No README, auxiliary Python module,
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '120.2.0'
+__version__ = '120.3.0'
 
 
 # scanner/core.py
@@ -97,7 +97,7 @@ class Config:
     acceptance_buffer_atr: float = 0.12
     max_target_projection_atr: float = 4.0
     one_itm_execution_tolerance: float = 0.06
-    # v120.2: session-wide, independent price-action level tests. All values
+    # v120.3: session-wide, independent price-action level tests. All values
     # are deterministic engineering thresholds; no statistically fitted edge.
     level_zone_atr: float = 0.28
     level_reset_atr: float = 0.65
@@ -125,7 +125,7 @@ class Config:
     last_minute_dispatch_buffer: float = 3.0
     minimum_entry_to_exit_minutes: float = 8.0
     reversal_short_window_bars: int = 3
-    # v120.2: closed-price early discovery, impulse exhaustion and episode integrity.
+    # v120.3: closed-price early discovery, impulse exhaustion and episode integrity.
     # Fixed engineering thresholds, not back-tested profitability estimates.
     early_recovery_body_atr: float = 0.18
     early_recovery_change_atr: float = 0.18
@@ -179,6 +179,8 @@ class Config:
             raise DataError('Invalid strategy configuration')
         if self.max_risk > 30 or self.min_rr < 1.25:
             raise DataError('Approved risk limits cannot be weakened')
+        if self.watch_minutes != 8:
+            raise DataError('Eight-minute independent watch policy cannot be overridden')
         if not isinstance(self.forecast_horizon_minutes, int) or isinstance(self.forecast_horizon_minutes, bool) or (not 3 <= self.forecast_horizon_minutes <= 60):
             raise DataError('Invalid forecast horizon')
         if any((not isinstance(v, int) or isinstance(v, bool) for v in (self.intraday_hard_exit_hour, self.intraday_hard_exit_minute, self.entry_cutoff_lead_minutes))):
@@ -2346,7 +2348,7 @@ def migrate_state(source, destination, now):
     if schema in (1,2,3,4,5,6,7):
         state=load(source,allow_legacy=True)
         preserve_intraday_oi=(schema in (5,6,7))
-        state.update(schema=7,engine_version='120.2.0',thesis=None,setup_watches=[],
+        state.update(schema=7,engine_version='120.3.0',thesis=None,setup_watches=[],
                      opportunity_journal=[],futures_snapshot=None,price_action_ledger={},market_phase={})
         if not preserve_intraday_oi:
             state.update(oi_snapshot=None,oi_history=[],session_oi_baseline=None)
@@ -2361,7 +2363,7 @@ def migrate_state(source, destination, now):
     elif legacy.get('schema_version') in (107,109):
         if legacy.get('position_reconciliation_required'):
             raise StateError('Legacy state requires reconciliation; it cannot be migrated as flat')
-        state={'schema':7,'engine_version':'120.2.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
+        state={'schema':7,'engine_version':'120.3.0','initialized_at':now.isoformat(),'session_date':legacy.get('session_date'),
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[],'opportunity_journal':[]}
         original=legacy.get('active_position')
@@ -2403,7 +2405,7 @@ def migrate_state(source, destination, now):
         raise StateError('Unsupported migration schema; no state was created')
 
     digest=hashlib.sha256(raw).hexdigest()
-    archive=destination.parent/'archives_v119_2'/(source.name+'.'+digest[:16]+'.json')
+    archive=destination.parent/'archives_v120_3'/(source.name+'.'+digest[:16]+'.json')
     if not archive.exists():
         archive.parent.mkdir(parents=True,exist_ok=True)
         fd,tmp=tempfile.mkstemp(dir=archive.parent,prefix='.migration-')
@@ -2483,13 +2485,13 @@ def load(path: Path, allow_legacy=False):
     if not allow_legacy:
         if state.get('entry_quality_revision') not in (1191, 1192):
             raise StateError('SCHEMA7_PREVIOUS_STATE_REQUIRES_OPERATOR_MIGRATION: do not copy an older state in place')
-        state['schema']=7;state['engine_version']='120.2.0'
+        state['schema']=7;state['engine_version']='120.3.0'
     return state
 
 
 def initialize(path: Path, now: datetime):
     if path.exists():raise StateError('State already exists; refusing to overwrite')
-    save(path,{'schema':7,'engine_version':'120.2.0','initialized_at':now.isoformat(),'initialized_flat':True,'entry_quality_revision':1192,'session_date':None,
+    save(path,{'schema':7,'engine_version':'120.3.0','initialized_at':now.isoformat(),'initialized_flat':True,'entry_quality_revision':1192,'session_date':None,
                'thesis':None,'position':None,'history':[],'outbox':[],'last_exit':None,'oi_snapshot':None,'oi_history':[],
                'session_oi_baseline':None,'setup_watches':[],'thesis_history':[],'opportunity_journal':[]})
 
@@ -3513,7 +3515,7 @@ def add_phase_to_forecast(result: dict, market_phase: dict) -> None:
         forecast['entry_readiness']='INDEPENDENT_VALIDATED_REACTION_REQUIRED'
 
 # ============================================================================
-# v120.2 OI-FIRST CAUSAL MARKET ENGINE -- embedded in this single production file
+# v120.3 OI-FIRST CAUSAL MARKET ENGINE -- embedded in this single production file
 # ============================================================================
 # The PE/CE options open-interest concentration defines *candidate* price
 # barriers. Completed price reactions determine which ones are defended,
@@ -3835,6 +3837,335 @@ def v1202_countertrend_gate(direction: str, setup_kind: str,
     return True, 'OI_ZONE_RECLAIM_WITH_CLOSED_1M_AND_3M'
 
 
+def v1203_protected_thesis_gate(direction: str, kind: str, spot: float,
+                                 bars: list[Candle], structure: dict,
+                                 zone: OIZone1201,
+                                 zones: list[OIZone1201],
+                                 config: Config) -> tuple[bool, str]:
+    """Protect established structure on *both* sides without hardcoded trades.
+
+    A tactical bearish CE-wall rejection during an underlying bullish thesis
+    is permitted only when the conflicting PE support is not defended, and
+    the same-strike OI-lip exception is observable. Otherwise countertrend
+    requires completed structural acceptance (not a one-candle reaction).
+    """
+    protected = str(structure.get('direction') or 'RANGE')
+    if protected not in ('BULLISH', 'BEARISH') or direction == protected:
+        return True, 'WITH_ESTABLISHED_OR_RANGE_STRUCTURE'
+    a = max(1.0, atr(bars))
+    closed_threes = aggregate(bars, 3)
+    if not closed_threes or not v1201_three_direction(bars, direction, a):
+        return False, 'PROTECTED_THESIS_NO_COMPLETED_3M_REVERSAL'
+    if direction == 'BULLISH':
+        return v1202_countertrend_gate(direction, kind, spot, bars,
+                                      structure, zone, config)
+    # BEARISH against protected bullish market: do not allow one rejected
+    # CE strike to override nearby, defended Put-OI support.
+    if kind != 'OI_ZONE_RESISTANCE_REJECTION' or zone.side != 'CE' or not zone.rejection:
+        return False, 'BULLISH_PROTECTED_THESIS_UNBROKEN'
+    if not any(c.low <= zone.high and c.high >= zone.low for c in bars[-4:]):
+        return False, 'NO_RECENT_CE_PRICE_TEST_FOR_COUNTERTREND_PE'
+    nearby_supports = [z for z in zones if z.side == 'PE'
+                       and not z.accepted_below and z.low - .5 * a <= spot <= z.high]
+    for support in nearby_supports:
+        if not v1201_support_upper_lip_probe(support, spot, zones, protected):
+            return False, 'DEFENDED_PUT_OI_SUPPORT_BLOCKS_COUNTERTREND_PE'
+    # A broader protected thesis may only break with a 3m close below its
+    # defended boundary. The special same-strike rejection above is treated
+    # as a tactical setup, never as proof that the thesis has reversed.
+    boundary = structure.get('support')
+    last_three = closed_threes[-1]
+    accepted_break = bool(boundary is not None and
+                          last_three.close < float(boundary) - .10 * a and
+                          bars[-1].close < float(boundary) - .10 * a)
+    tactical = bool(nearby_supports and
+                    all(v1201_support_upper_lip_probe(z, spot, zones, protected)
+                        for z in nearby_supports) and
+                    bars[-1].close < bars[-2].close and
+                    v1201_price_alignment(bars, 'BEARISH', a))
+    if not (accepted_break or tactical):
+        return False, 'NO_CONFIRMED_SUPPORT_BREAK_OR_SAME_STRIKE_REJECTION'
+    return True, ('CLOSED_3M_PROTECTED_SUPPORT_BREAK' if accepted_break else
+                  'CAUSAL_SAME_STRIKE_CE_REJECTION_TACTICAL_PROBE')
+
+
+def v1203_price_structure_candidates(bars: list[Candle], spot: float,
+                                     zones: list[OIZone1201], thesis: dict,
+                                     context: dict, config: Config):
+    """Opening and trend continuation opportunities beyond direct OI touches.
+
+    Completed 1m price is the trigger, completed 3m is the confirmation;
+    contemporaneous PE OI behind rising price / CE OI above falling price is
+    supporting context. The OI snapshot is NEVER projected backward to prior
+    candles. Every candidate still passes all opposition, stop, target,
+    live contract and protected-thesis gates before it becomes an email.
+    """
+    rows, diagnostics = [], []
+    if len(bars) < config.min_bars or len(aggregate(bars, 3)) < 2:
+        return rows, diagnostics
+    a = max(1., atr(bars))
+    threes = aggregate(bars, 3)
+    phase = (context.get('market_phase') or {}).get('phase')
+    protected = str(thesis.get('direction') or 'RANGE')
+    close_time = bars[-1].start + timedelta(minutes=1)
+    day_open = bars[0].start.replace(hour=9, minute=15, second=0, microsecond=0)
+    minutes = (close_time - day_open).total_seconds() / 60
+    opening_high = max(c.high for c in bars[:3])
+    opening_low = min(c.low for c in bars[:3])
+    for direction in ('BULLISH', 'BEARISH'):
+        sign = 1 if direction == 'BULLISH' else -1
+        if protected in ('BULLISH', 'BEARISH') and protected != direction:
+            continue  # Only the independently proven OI reclaim/rejection path can reverse.
+        if ((direction == 'BULLISH' and phase == 'BEARISH_TREND') or
+            (direction == 'BEARISH' and phase == 'BULLISH_TREND')):
+            continue
+        if not v1201_price_alignment(bars, direction, a):
+            continue
+        supportive = [z for z in zones if
+                      ((direction == 'BULLISH' and z.side == 'PE' and
+                        z.strike <= spot and not z.accepted_below) or
+                       (direction == 'BEARISH' and z.side == 'CE' and
+                        z.strike >= spot and not z.accepted_above)) and
+                      abs(z.strike - spot) <= max(3 * config.strike_step, 3 * a)]
+        if not supportive:
+            diagnostics.append({'direction': direction,
+                                'reason': 'NO_CONTEMPORANEOUS_FRIENDLY_OI_ZONE'})
+            continue
+        anchor = min(supportive, key=lambda z:
+                     (abs(z.strike - spot), -z.strength))
+        # If all legs already ran far without an opposite-bar reset, the
+        # completed opening impulse is not a fresh breakout to chase.
+        opening = (6 <= minutes <= 12 and
+                   sign * (bars[-1].close -
+                           (opening_high if sign == 1 else opening_low)) >= .10 * a and
+                   sign * (bars[-1].close - bars[0].open) >= .60 * a)
+        trend = False
+        if len(threes) >= 3 and minutes > 12:
+            prior, latest = threes[-2:]
+            prior_edge = prior.high if sign == 1 else prior.low
+            trend = bool(
+                sign * (latest.close - prior_edge) >= .10 * a and
+                sign * (latest.close - latest.open) >= .30 * a and
+                sign * (bars[-1].close - bars[-1].open) >= .08 * a and
+                ((bars[-1].close - bars[-1].low) /
+                 max(0.01, bars[-1].high - bars[-1].low) >= .62 if sign == 1
+                 else (bars[-1].high - bars[-1].close) /
+                 max(0.01, bars[-1].high - bars[-1].low) >= .62))
+        if not (opening or trend):
+            continue
+        kind = 'OPENING_MOMENTUM' if opening else 'PRICE_STRUCTURE_CONTINUATION'
+        stop = (min(c.low for c in bars[-4:]) - config.stop_buffer if sign == 1
+                else max(c.high for c in bars[-4:]) + config.stop_buffer)
+        ok, reason, checks = v1201_gate(
+            direction, spot, bars, zones, stop, protected, config, kind)
+        diagnostics.append({'kind':kind, 'direction':direction,
+                            'oi_anchor':anchor.strike, 'reason':reason,
+                            'checks': checks})
+        if not ok:
+            continue
+        # The independent watch gate handles a fresh 3m confirmation again.
+        rows.append({
+            'kind':kind, 'direction':direction,
+            'trigger':float(bars[-1].close),
+            'confirmed_at':close_time.isoformat(),
+            'source_price_trigger_at':close_time.isoformat(),
+            'three_confirmed_at':
+                (threes[-1].start + timedelta(minutes=3)).isoformat(),
+            'invalidation':round(stop,5), 'trade_invalidation':round(stop,5),
+            'atr_1m':a, 'stop_role':'COMPLETED_1M_PULLBACK_LOW_HIGH',
+            'protected_thesis_boundary': thesis.get(
+                'support' if direction == 'BULLISH' else 'resistance'),
+            'thesis_invalidation':{'level':thesis.get(
+                'support' if direction == 'BULLISH' else 'resistance'),
+                'requires':'CONFIRMED_COMPLETED_3M_BREAK'},
+            'dependencies':[{'kind':'FRESH_FRIENDLY_OI_CONTEXT_AND_PRICE_BREAK',
+                             'strike':anchor.strike, 'side':anchor.side,
+                             'bounds':[anchor.low,anchor.high],
+                             'instrument_key':anchor.instrument_key}],
+            'oi_anchor':anchor.as_dict(),
+            'evidence':['CLOSED_1M_PRICE_BREAK','COMPLETED_3M_CONFIRMATION',
+                        'CONTEMPORANEOUS_SUPPORTIVE_OPTION_OI',
+                        'NO_UNACCEPTED_OPPOSING_OI_BARRIER',
+                        'STRUCTURAL_UNCOMPRESSED_RISK'],
+        })
+    return rows, diagnostics
+
+
+def v1203_watch_identity(setup: dict, expiry: str) -> str:
+    """Multiple OI levels and directions never share a watch identity."""
+    anchor = setup['oi_anchor']
+    raw = json.dumps([expiry, setup['direction'], setup['kind'],
+                      anchor['side'], float(anchor['strike']),
+                      anchor['instrument_key']], separators=(',', ':'),
+                     sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def v1203_refresh_oi_watches(state: dict, fresh: list[dict],
+                              zones: list[OIZone1201], bars: list[Candle],
+                              spot: float, thesis: dict, expiry: str,
+                              now: datetime, config: Config):
+    """Eight-minute independent, fail-closed, causally revalidated watches.
+
+    A watch is a persistent *observation*, never an unqualified entry email.
+    Revalidation uses only CURRENT OI/quotes and closed 1m/3m bars. Old bars
+    never gain new OI readings retroactively. A watch lacking fresh validation
+    remains visible in audit but cannot be traded. A fresh price episode after
+    expiry receives a new watch rather than silently resurrecting an old one.
+    """
+    previous = state.get('setup_watches') or []
+    candidates = {v1203_watch_identity(x, expiry): x for x in fresh}
+    current_zones = {(z.instrument_key, z.side, z.strike): z for z in zones}
+    active, qualified, diag = [], [], []
+    closed_one_at = bars[-1].start + timedelta(minutes=1)
+    latest_three = aggregate(bars, 3)
+    recent_three_at = (latest_three[-1].start + timedelta(minutes=3)
+                       if latest_three else None)
+    all_ids = set()
+    for old in previous:
+        if not isinstance(old, dict) or old.get('expiry') != expiry:
+            continue
+        try:
+            created = datetime.fromisoformat(old['created_at'])
+            expiry_time = datetime.fromisoformat(old['expires_at'])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if now >= expiry_time or created > now:
+            diag.append({'watch_id': old.get('id'), 'status': 'EXPIRED'})
+            continue
+        if (now - created).total_seconds() > 60 * config.watch_minutes:
+            continue
+        ident = old.get('id')
+        if ident in all_ids:
+            continue
+        all_ids.add(ident)
+        active.append(dict(old))
+    for key, setup in candidates.items():
+        if key in all_ids:
+            continue
+        row = {'id': key, 'expiry': expiry, 'created_at': now.isoformat(),
+               'expires_at': (now + timedelta(minutes=config.watch_minutes)).isoformat(),
+               'origin_three_confirmed_at': setup['three_confirmed_at'],
+               'origin_price_trigger_at': setup['source_price_trigger_at'],
+               'setup': copy.deepcopy(setup), 'status': 'OPEN'}
+        active.append(row)
+        all_ids.add(key)
+    # Every watch is independently revalidated. Failure of watch A never
+    # removes B or returns early from this loop.
+    for watch in active:
+        ident = watch['id']
+        setup = candidates.get(ident) or copy.deepcopy(watch['setup'])
+        direction = setup['direction']
+        anchor = setup['oi_anchor']
+        try:
+            zone = current_zones[(anchor['instrument_key'], anchor['side'],
+                                  float(anchor['strike']))]
+        except KeyError:
+            watch['status'] = 'OI_WALL_NOT_OBSERVED'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        sign = 1 if direction == 'BULLISH' else -1
+        a = max(1., atr(bars))
+        prior_stop = float(setup['trade_invalidation'])
+        if (sign * (spot - prior_stop) <= 1 or
+            sign * (bars[-1].close - prior_stop) <= 0):
+            watch['status'] = 'INVALIDATED_BY_PRICE'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        if not latest_three or not v1201_price_alignment(bars, direction, a):
+            watch['status'] = 'WAITING_COMPLETED_1M_3M_CONFIRMATION'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        if not recent_three_at or recent_three_at > closed_one_at:
+            watch['status'] = 'NO_COMPLETED_3M'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        if not v1201_three_direction(bars, direction, a):
+            watch['status'] = '3M_NOT_ALIGNED'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        ok, reason = v1203_protected_thesis_gate(
+            direction, setup['kind'], spot, bars, thesis, zone, zones, config)
+        if not ok:
+            watch['status'] = reason
+            diag.append({'watch_id': ident, 'status': reason})
+            continue
+        # The watch's scenario must still be alive in the current fresh OI
+        # zone, not just remembered from an old snapshot.
+        kind = setup['kind']
+        zone_status = {
+            'OI_ZONE_RESISTANCE_REJECTION': zone.rejection,
+            'OI_ZONE_SUPPORT_DEFENSE': zone.defense,
+            'OI_ZONE_SUPPORT_RECLAIM': not zone.accepted_below and spot >= zone.high,
+            'OI_ZONE_SUPPORT_ACCEPTANCE': zone.accepted_below and spot < zone.low,
+            'OI_ZONE_RESISTANCE_ACCEPTANCE': zone.accepted_above and spot > zone.high,
+            'OI_ZONE_BEARISH_RETEST_CONTINUATION': not zone.accepted_above and spot < zone.low,
+            'OI_ZONE_BULLISH_RETEST_CONTINUATION': not zone.accepted_below and spot > zone.high,
+            'OPENING_MOMENTUM': (
+                (direction == 'BULLISH' and zone.side == 'PE' and
+                 zone.strike <= spot and not zone.accepted_below) or
+                (direction == 'BEARISH' and zone.side == 'CE' and
+                 zone.strike >= spot and not zone.accepted_above)),
+            'PRICE_STRUCTURE_CONTINUATION': (
+                (direction == 'BULLISH' and zone.side == 'PE' and
+                 zone.strike <= spot and not zone.accepted_below) or
+                (direction == 'BEARISH' and zone.side == 'CE' and
+                 zone.strike >= spot and not zone.accepted_above)),
+        }.get(kind, False)
+        if not zone_status:
+            watch['status'] = 'ORIGIN_OI_SCENARIO_NO_LONGER_VALID'
+            diag.append({'watch_id': ident, 'status': watch['status']})
+            continue
+        # Historical watches require a current completed bullish/bearish
+        # body and an unbroken origin trigger, not just an old 3m context.
+        if ident not in candidates:
+            if sign * (bars[-1].close - bars[-1].open) < .10 * a:
+                watch['status'] = 'AWAITING_FRESH_1M_TRIGGER'
+                diag.append({'watch_id': ident, 'status': watch['status']})
+                continue
+            if sign * (bars[-1].close - float(setup['trigger'])) < -.20 * a:
+                watch['status'] = 'ORIGINAL_PRICE_TRIGGER_LOST'
+                diag.append({'watch_id': ident, 'status': watch['status']})
+                continue
+        permitted, reason, detail = v1201_gate(
+            direction, spot, bars, zones, prior_stop,
+            str(thesis.get('direction') or 'RANGE'), config, kind)
+        if not permitted:
+            watch['status'] = reason
+            diag.append({'watch_id': ident, 'status': reason,
+                         'checks': detail})
+            continue
+        # Every promoted watch is evaluated at this scan's clock, not at an
+        # earlier quote or earlier OI snapshot.
+        candidate = copy.deepcopy(setup)
+        candidate['confirmed_at'] = closed_one_at.isoformat()
+        candidate['three_confirmed_at'] = recent_three_at.isoformat()
+        candidate['watch_opened_at'] = watch['created_at']
+        candidate['watch_id'] = ident
+        candidate['source_price_trigger_at'] = (bars[-1].start + timedelta(minutes=1)).isoformat()
+        candidate['oi_anchor'] = zone.as_dict()
+        candidate['evidence'] = list(dict.fromkeys(list(candidate.get('evidence') or []) +
+                           ['LIVE_REVALIDATED_EIGHT_MINUTE_WATCH',
+                            'CURRENT_OI_ZONE', 'COMPLETED_1M_AND_3M']))
+        watch['status'] = 'REVALIDATED'
+        watch['last_validated_at'] = now.isoformat()
+        watch['setup'] = copy.deepcopy(candidate)
+        diag.append({'watch_id': ident, 'status': 'REVALIDATED',
+                     'created_at': watch['created_at'],
+                     'last_completed_3m_at': recent_three_at.isoformat()})
+        qualified.append(candidate)
+    terminal = {'INVALIDATED_BY_PRICE', 'OI_WALL_NOT_OBSERVED',
+                'ORIGINAL_PRICE_TRIGGER_LOST', 'ORIGIN_OI_SCENARIO_NO_LONGER_VALID',
+                'BULLISH_PROTECTED_THESIS_UNBROKEN',
+                'DEFENDED_PUT_OI_SUPPORT_BLOCKS_COUNTERTREND_PE',
+                'BEARISH_PROTECTED_THESIS_REQUIRES_NEW_OI_RECLAIM'}
+    state['setup_watches'] = [w for w in active if w['status'] not in terminal][-100:]
+    state['watch_revision'] = 1203
+    qualified.sort(key=lambda x: (x['watch_opened_at'],
+                                  x['watch_id']))
+    return qualified, diag
+
+
 def v1201_setup_candidates(chain: list[dict], bars: list[Candle],
                            spot: float, oi_live: dict, structure: dict,
                            config: Config) -> tuple[list[dict], list[OIZone1201], list[dict]]:
@@ -4027,8 +4358,10 @@ def v1201_risk_plan(setup: dict, spot: float, context: dict,
     a = max(1., atr(bars))
     if sign * (spot - stop) <= 1:
         return None, 'INVALID_TACTICAL_STOP', {}
-    risk = max(sign * (spot - stop), config.min_stop_atr * a)
-    stop = spot - sign * risk
+    risk = sign * (spot - stop)
+    if risk < config.min_stop_atr * a:
+        return None, 'STRUCTURAL_STOP_TOO_TIGHT_FOR_VOLATILITY', {
+            'risk': round(risk, 5), 'required_atr_risk': round(config.min_stop_atr * a, 5)}
     if risk > config.max_risk:
         return None, 'TACTICAL_STOP_EXCEEDS_APPROVED_MAX_RISK', {'risk': risk}
     if now >= entry_cutoff_at(now, config):
@@ -4151,10 +4484,10 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
     try:
         # Strategy-only migration: NO destructive state migration. The existing
         # schema-7 position, history, OI baselines and email outbox remain.
-        if state.get('oi_strategy_revision') != 1201:
+        if state.get('oi_strategy_revision') != 1203:
             state['setup_watches'] = []
             state['opportunity_journal'] = []
-            state['oi_strategy_revision'] = 1201
+            state['oi_strategy_revision'] = 1203
             state['oi_strategy_activated_at'] = started.isoformat()
             # Protected thesis is recomputed from today's completed candles.
             state['thesis'] = None
@@ -4306,7 +4639,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v119_2.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v120_3.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -4431,12 +4764,19 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         result['forecast'] = forecast_market(bars, thesis, spot, context, result.get('futures'), config)
         add_phase_to_forecast(result,market_phase)
         evidence.update(candles=[[c.start.isoformat(), c.open, c.high, c.low, c.close, c.volume] for c in bars], quotes=full, evaluated_at=now.isoformat())
-        # v120.2: OI concentration defines zones; completed price proves
-        # rejection, defense or acceptance. Legacy watch paths do not run.
-        state['setup_watches'] = []
+        # Active OI/price setups are independently watched for at most eight
+        # minutes, revalidated against fresh OI, completed bars and live spot.
+        # A rejected watch cannot prevent another direction or zone qualifying.
         state['last_setup_candle'] = bars[-1].start.isoformat()
-        setups, zones, zone_checks = v1201_setup_candidates(
+        fresh_setups, zones, zone_checks = v1201_setup_candidates(
             chain, bars, spot, context, thesis, config)
+        extra_setups, extra_diagnostics = v1203_price_structure_candidates(
+            bars, spot, zones, thesis, context, config)
+        fresh_setups.extend(extra_setups)
+        zone_checks.extend(extra_diagnostics)
+        setups, watch_diagnostics = v1203_refresh_oi_watches(
+            state, fresh_setups, zones, bars, spot, thesis, expiry, now, config)
+        result['setup_watch_diagnostics'] = watch_diagnostics
         result['oi_zone_analysis'] = {
             'method': 'OI_CONCENTRATION_PLUS_CLOSED_1M_3M_PRICE',
             'zones': [z.as_dict() for z in zones],
@@ -4451,7 +4791,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             'closed_3m': thesis.get('last_3m'),
             'protected_thesis': thesis.get('direction'),
             'market_phase': market_phase.get('phase'),
-            'fresh_candidates': len(setups), 'legacy_watch_count': 0,
+            'fresh_candidates': len(fresh_setups), 'active_watches': len(state['setup_watches']),
         }
         if now >= entry_cutoff_at(now, config):
             result['reason'] = 'ENTRY_TOO_CLOSE_TO_1515_HARD_EXIT'
@@ -4477,10 +4817,18 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             # because the same 3m episode still appears in the option chain.
             if last.get('at'):
                 ex = datetime.fromisoformat(last['at'])
-                if (datetime.fromisoformat(setup['confirmed_at']) <= ex or
-                    (last.get('direction') == direction and
-                     (now - ex).total_seconds() < 180)):
-                    row['reason'] = 'WAIT_FOR_NEW_POST_EXIT_STRUCTURE'
+                current_three = datetime.fromisoformat(setup['three_confirmed_at'])
+                trigger_time = datetime.fromisoformat(setup['source_price_trigger_at'])
+                # A genuinely new completed three-minute candle AND a fresh
+                # one-minute trigger are required after the exit. No arbitrary
+                # three-minute cooldown applies to opposite validated reversals.
+                original_watch = datetime.fromisoformat(setup.get(
+                    'watch_opened_at', setup['confirmed_at']))
+                # Re-entering the same direction from a watch that predates
+                # the last exit is not an independent new setup.
+                if (current_three <= ex or trigger_time <= ex or
+                    (direction == last.get('direction') and original_watch <= ex)):
+                    row['reason'] = 'NEW_POST_EXIT_SETUP_3M_AND_1M_REQUIRED'
                     evaluated.append(row)
                     continue
             plan, reason, plan_diag = v1201_risk_plan(
@@ -4538,7 +4886,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
              'score_is_probability': False}
             for item in qualified]
         result['opportunity_discovery'] = {
-            'first_observed_at': now.isoformat(),
+            'first_observed_at': setup.get('watch_opened_at', now.isoformat()),
             'source_price_trigger_at': setup['source_price_trigger_at'],
             'confirmed_at': setup['confirmed_at'], 'not_backdated': True,
             'kind': setup['kind'], 'direction': setup['direction'],
@@ -4630,11 +4978,11 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v119_2' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v120_3' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v119_2_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v120_3_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
 
@@ -4650,7 +4998,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 def paths():
-    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v119_2.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
+    return (Path(os.environ.get('STATE_FILE', 'state/market_state_v120_3.json')), Path(os.environ.get('AUDIT_DIR', 'audit')))
 
 def alert_label(event: dict) -> str:
     """Clear user-facing label; no broker fill is asserted."""
@@ -4836,7 +5184,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v119_2_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v120_3_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -4845,7 +5193,7 @@ def main():
                     raise StateError('Alert ID is not a claimed or uncertain actionable alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v119_2_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v120_3_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
