@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY price-structure predictive scanner v122.3.0 — causally gated tactical price-structure release.
+"""NIFTY price-structure predictive scanner v122.4.0 — causally gated tactical price-structure release.
 
 Completed price bars -> protected structure -> conditional forward scenarios ->
 independently revalidated eight-minute watches -> fixed risk plan -> one quoted option contract ->
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 
 # scanner/__init__.py
-__version__ = '122.3.0'
+__version__ = '122.4.0'
 
 
 # scanner/core.py
@@ -147,14 +147,24 @@ class Config:
     pre_t1_trail_profit_r: float = 1.25
     pre_t1_trail_buffer_atr: float = 0.65
     defended_level_acceptance_bars: int = 2
-    # v122.3: previous COMPLETE 3-minute candle is the default tactical
+    # v122.4: previous COMPLETE 3-minute candle is the default tactical
     # invalidation reference. A buffer avoids stops exactly on a traded close.
     previous_three_stop_buffer_atr: float = 0.08
-    previous_three_trail_min_profit_r: float = 1.0
+    previous_three_trail_min_profit_r: float = 1.0  # legacy configuration; close-based trailing disabled
+    # A 3m close is a reference, not automatically an invalidation point.
+    stop_local_lookback_minutes: int = 9
+    stop_min_distance_atr: float = 0.80
+    stop_swing_buffer_atr: float = 0.20
+    stop_invalidating_candle_body_atr: float = 0.25
     oi_decision_nearby_points: float = 150.0
     oi_conflict_min_material_rows: int = 2
 
     def __post_init__(self):
+        if not (5 <= self.stop_local_lookback_minutes <= 18 and
+                .5 <= self.stop_min_distance_atr <= 2.0 and
+                .10 <= self.stop_swing_buffer_atr <= .65 and
+                .10 <= self.stop_invalidating_candle_body_atr <= .65):
+            raise DataError('INVALID_STRUCTURAL_STOP_POLICY')
         if not (0 < self.previous_three_stop_buffer_atr <= .5 and
                 .5 <= self.previous_three_trail_min_profit_r <= 3 and
                 50 <= self.oi_decision_nearby_points <= 400 and
@@ -3151,8 +3161,7 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
         if rev.get('direction')==structure['direction'] and rev.get('confirmed_at'):
             if datetime.fromisoformat(rev['confirmed_at'])>=opened:
                 return finish('OPPOSITE_STRUCTURE_CONFIRMED',now,spot,'TWO_CLOSED_3M_ACCEPTANCES')
-    # Structural trailing uses fully confirmed three-minute pivots, and before
-    # T1 additionally requires a fresh, matched positive OI change.
+    # Structural trailing uses fully confirmed three-minute pivots AFTER T1 only.
     completed_threes=aggregate(ordered,3)
     low,high=pivots(completed_threes)
     candidate_pivots=low if sign==1 else high
@@ -3160,42 +3169,11 @@ def manage(position, bars, spot, quote, now, market_close, config, structure=Non
     if eligible:
         _,pivot=eligible[-1]
         candidate=pivot-sign*max(config.stop_buffer,0.1*volatility)
-        if p.get('t1_hit'):
+        if p.get('t1_hit') and sign*(spot-candidate)>=max(.80*volatility,config.stop_buffer):
             update_stop(candidate,'CONFIRMED_3M_RUNNER_STRUCTURE',now)
-        else:
-            wall=oi.get('put_support' if sign==1 else 'call_resistance') or {}
-            supportive=(oi.get('fresh_snapshot') and wall.get('oi_change') is not None and
-                        float(wall['oi_change'])>0 and wall.get('strike') is not None and
-                        abs(float(wall['strike'])-pivot)<=config.strike_step)
-            initial_risk=abs(float(p['entry_spot'])-float(
-                (p.get('plan') or {}).get('stop_underlying',p['stop'])))
-            completed_after_entry=sum(c.start>=opened.replace(second=0,microsecond=0)
-                                     for c in completed_threes)
-            if (supportive and completed_after_entry>=3 and
-                _pre_t1_trail_eligible(p,config)):
-                # A confirmed 3m pivot is not a stop price: the wick/ATR
-                # noise buffer belongs BEYOND the defended level.
-                cushion=max(config.stop_buffer,
-                            config.pre_t1_trail_buffer_atr*volatility,
-                            .25*initial_risk)
-                buffered=pivot-sign*cushion
-                # No ratchet into ordinary pullback noise. The stop remains
-                # a *strictly more protective* price if adopted.
-                if sign*(spot-buffered)>=max(.85*volatility,cushion):
-                    update_stop(buffered,'V1221_BUFFERED_3M_PIVOT_AND_MATCHED_OI',now)
-    # v122.3: optional 3-minute-close ratchet. It is never backdated and
-    # only tightens an existing stop after measured progress >= 1 initial R.
-    initial_stop=float((p.get('plan') or {}).get('stop_underlying',p['stop']))
-    initial_risk=sign*(float(p['entry_spot'])-initial_stop)
-    favorable=sign*(float(p.get('best_spot',spot))-float(p['entry_spot']))
-    if initial_risk>0 and favorable>=config.previous_three_trail_min_profit_r*initial_risk:
-        prior3=v1223_previous_three_stop(ordered,now,spot,direction,config)
-        if prior3.get('valid_side'):
-            candidate=float(prior3['stop'])
-            # Trailing stop must not sit at/through the current quote or
-            # expand beyond the original stop.
-            if sign*(spot-candidate)>max(config.stop_buffer,.15*volatility):
-                update_stop(candidate,'LAST_COMPLETED_3M_CLOSE_TRAIL',now)
+        # NO pre-T1 pivot ratchet: intact structural SL must remain unchanged.
+    # v122.4: no close-based trailing. The entry stop is retained through T1.
+    # After T1, only structurally confirmed 3m pivots may tighten it.
     premium_drawdown=None; premium_cap=None
     if quote_bid is not None:
         if quote_bid<=float(p['entry_ask'])*(1-config.premium_hard_loss_pct/100):
@@ -5811,6 +5789,60 @@ def v1223_tactical_countertrend_gate(setup: dict, bars: list[Candle],
     return False,'COUNTERTREND_AWAITING_TWO_PRICE_CONFIRMATIONS'
 
 
+def v1224_structural_initial_stop(setup: dict, spot: float, bars: list[Candle],
+                                  now: datetime, config: Config) -> dict:
+    """Causal invalidation: 3m CLOSE + pre-existing adverse 1m/3m swing.
+
+    The reference close is always disclosed but is not adopted if a nearby
+    prior swing makes it an ordinary intrabar fluctuation. No arbitrary
+    30-point ceiling, no forced minimum-point stop and no forward candles.
+    """
+    if not bars or not isfinite(spot) or spot <= 0:
+        return {'valid': False, 'reason': 'INVALID_STOP_INPUT'}
+    direction=setup['direction']; sign=1 if direction=='BULLISH' else -1
+    completed=[b for b in bars if b.start+timedelta(minutes=1)<=now]
+    if len(completed)<3:
+        return {'valid':False,'reason':'INSUFFICIENT_COMPLETED_STOP_CANDLES'}
+    a=max(1.,atr(completed))
+    prior_three=v1223_previous_three_stop(completed,now,spot,direction,config)
+    lookback=completed[-config.stop_local_lookback_minutes:]
+    threes=[c for c in aggregate(completed,3) if c.start+timedelta(minutes=3)<=now]
+    if not threes:
+        return {'valid':False,'reason':'NO_COMPLETED_3M_STOP_REFERENCE'}
+    # The most recently completed 3m candle represents the current episode;
+    # earlier 3m swings belong to the protected thesis, not the tactical stop.
+    current_three=threes[-1]
+    # Latest 3 completed 1m bars give a tighter *local* swing candidate,
+    # but the complete 3m high/low remains the conservative invalidation.
+    local=completed[-3:]
+    adverse_1m=min(x.low for x in local) if sign==1 else max(x.high for x in local)
+    adverse_3m=current_three.low if sign==1 else current_three.high
+    # Local 1m and 3m extremes are known only at the end of completed bars.
+    # A genuine invalidation lies BEYOND the adverse extreme, never inside it.
+    swing= min(adverse_1m,adverse_3m) if sign==1 else max(adverse_1m,adverse_3m)
+    cushion=max(config.stop_buffer,config.stop_swing_buffer_atr*a)
+    swing_stop=swing-sign*cushion
+    # A 3m close cannot create a tighter SL than the adverse structural swing.
+    # The 0.8 ATR minimum guards against accidental ultra-tight stops but
+    # is not a substitute for a valid, observable adverse structural extreme.
+    min_vol_stop=spot-sign*config.stop_min_distance_atr*a
+    candidates=[swing_stop,min_vol_stop]
+    if prior_three.get('valid_side'):
+        candidates.append(float(prior_three['stop']))
+    stop=min(candidates) if sign==1 else max(candidates)
+    risk=sign*(spot-stop)
+    if not (isfinite(risk) and risk>0 and sign*(swing-stop)>0):
+        return {'valid':False,'reason':'NO_VALID_PRIOR_STRUCTURAL_INVALIDATION',
+                'prior_three':prior_three}
+    return {'valid':True,'stop':round(stop,5),'risk_points':round(risk,5),
+            'atr_1m':round(a,5), 'swing':round(swing,5),
+            'swing_stop':round(swing_stop,5),'prior_three':prior_three,
+            'lookback_first':lookback[0].start.isoformat(),
+            'lookback_last':lookback[-1].start.isoformat(),
+            'stop_source':'CAUSAL_1M_3M_ADVERSE_SWING_WITH_3M_CLOSE_REFERENCE',
+            'three_minute_reference_kept_as_context':True}
+
+
 def structural_price_risk_plan(setup:dict,spot:float,ledger:dict,
                                bars:list[Candle],now:datetime,
                                config:Config) -> tuple[dict|None,str,dict]:
@@ -5818,19 +5850,17 @@ def structural_price_risk_plan(setup:dict,spot:float,ledger:dict,
     sign=1 if setup['direction']=='BULLISH' else -1
     a=max(1.,atr(bars))
     original_stop=float(setup['trade_invalidation'])
-    three=v1223_previous_three_stop(bars,now,spot,setup['direction'],config)
-    # Default to the previous 3m close; fall back to a causal 1m structural
-    # invalidation only if that 3m close lies on the wrong side of entry.
-    if three.get('valid_side'):
-        stop=float(three['stop'])
-        source='PREVIOUS_COMPLETED_3M_CANDLE_CLOSE'
-    else:
-        stop=original_stop
-        source='VALIDATED_LOCAL_PRICE_INVALIDATION_3M_CLOSE_WRONG_SIDE'
+    stop_model=v1224_structural_initial_stop(setup,spot,bars,now,config)
+    diagnostics={'original_trade_invalidation':original_stop,
+                 'stop_model':stop_model,'OI_WALL_AUTOMATIC_REJECTION':False}
+    if not stop_model['valid']:
+        return None,stop_model['reason'],diagnostics
+    stop=float(stop_model['stop'])
+    source=stop_model['stop_source']
+    three=stop_model['prior_three']
     raw_risk=sign*(spot-stop)
-    diagnostics={'structural_stop':original_stop,'prior_completed_three':three,
-                 'selected_stop_source':source,'raw_risk':round(raw_risk,5),
-                 'OI_WALL_AUTOMATIC_REJECTION':False}
+    diagnostics.update(structural_stop=stop,raw_risk=round(raw_risk,5),
+                       selected_stop_source=source)
     if raw_risk<=0 or not isfinite(raw_risk):return None,'INVALID_STRUCTURAL_STOP',diagnostics
     # No fixed point cap. A large reference risk must still clear both the
     # first credible price obstacle and the causal, bounded target budget.
@@ -5890,6 +5920,7 @@ def structural_price_risk_plan(setup:dict,spot:float,ledger:dict,
           'trade_invalidation_role':source,
           'initial_three_reference':three,
           'original_price_structure_stop':original_stop,
+          'validated_initial_stop':stop_model,
           'target_source':target_source,'target_quality':
              'CONFIRMED_PRICE_LEVEL' if first and target_source!=
                   'BOUNDED_CAUSAL_PRICE_PROJECTION' else 'ENGINEERING_PROJECTION_NOT_BACKTEST_PROVEN',
@@ -6094,7 +6125,7 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
             if reversal_exit is None:
                 return result
         try:
-            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v122_3.json'))
+            future = api.nearest_nifty_future(now, Path('.cache/nifty_futures_v122_4.json'))
             fq = api.quotes([future['instrument_key']]).get(future['instrument_key'], {})
             ft = tick()
             fp = checked_spot(fq, ft, config.max_quote_age)
@@ -6497,11 +6528,11 @@ def scan(state: dict[str, Any], api: Upstox, config: Config, audit_dir: Path, ti
         # a qualified reference position or its durable outbox lock. main()
         # still commits state and exits nonzero so the workflow reports failure.
         try:
-            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v122_3' / day, identifier, evidence)
+            result['input_capture'] = capture_inputs(audit_dir / 'inputs_v122_4' / day, identifier, evidence)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='INPUT_CAPTURE_FAILED_'+type(exc).__name__
         try:
-            append_audit(audit_dir / ('market_scan_v122_3_' + day + '.jsonl'), result)
+            append_audit(audit_dir / ('market_scan_v122_4_' + day + '.jsonl'), result)
         except (OSError,ValueError,TypeError) as exc:
             result['persistence_error']='AUDIT_WRITE_FAILED_'+type(exc).__name__
 
@@ -6703,7 +6734,7 @@ def main():
                 state['position'] = None
                 state['last_exit'] = {'at': now, 'direction': closed.get('direction'), 'three': (state.get('thesis') or {}).get('last_3m')}
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v122_3_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
+                append_audit(audit_dir / ('market_scan_v122_4_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_RECONCILIATION', 'position_id': args.reconcile_flat, 'at': now, 'fill': 'UNKNOWN'})
                 print(json.dumps({'status': 'RECONCILED_FLAT', 'position_id': args.reconcile_flat, 'at': now}))
                 return 0
             if args.requeue_alert:
@@ -6712,7 +6743,7 @@ def main():
                     raise StateError('Alert ID is not a claimed or uncertain actionable alert')
                 event.update(status='PENDING', claim=None, manually_requeued_at=datetime.now(IST).isoformat())
                 save(state_path, state)
-                append_audit(audit_dir / ('market_scan_v122_3_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
+                append_audit(audit_dir / ('market_scan_v122_4_' + datetime.now(IST).date().isoformat() + '.jsonl'), {'operation': 'MANUAL_ALERT_REQUEUE', 'alert_id': args.requeue_alert, 'at': datetime.now(IST).isoformat()})
                 print(json.dumps({'status': 'REQUEUED', 'alert_id': args.requeue_alert}))
                 return 0
             token = os.environ.get('NOTIFICATION_CLAIM_TOKEN', '')
