@@ -1,35 +1,30 @@
-name: NIFTY predictive scanner v122.4.0 — Cloudflare 3-minute dispatcher
-# Deployment: KEEP the existing external Cloudflare Worker cadence (once every
-# THREE MINUTES). No change to Worker cron is required or requested.
-# Within each run, the scanner replays the completed one-minute candles missed
-# between invocations, but can qualify a strike ONLY at the current live quote.
-# No historical trade fills or backdated OI/option quotes are inferred.
+name: NIFTY scanner v126 (3-minute Cloudflare dispatch)
 
+# NO GitHub cron: keep the existing Cloudflare Worker and its 3-minute cadence.
+# Supports workflow_dispatch (the previous integration) plus optional repository_dispatch.
 on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Scan, initialize a verified flat state, or migrate/reconcile existing state
+        description: "scan, or an EXPLICIT manual state operation after broker/mailbox verification"
         type: choice
-        options: [scan, initialize_flat, migrate_state, reconcile_flat, requeue_alert]
+        required: true
         default: scan
+        options: [scan, initialize_flat, migrate_state, reconcile_flat, requeue_alert]
       source_state:
-        description: Existing state to preserve and migrate; used only for migrate_state
-        type: choice
-        options: [state/market_state_v119_2.json, state/market_state_v119_1.json, state/market_state_v119.json, state/market_state_v118.json, state/market_state_v117.json, state/market_state_v116.json, state/market_state_v115.json, state/market_state_v114_3.json, state/market_state_v114_1.json, state/market_state_v114.json, state/market_state_v113.json, state/market_state_v109.json, state/market_state_v107.json]
-        default: state/market_state_v119_2.json
+        description: "Existing repo state path for migrate_state (only when destination absent)"
+        type: string
+        required: false
       position_id:
-        description: Exact current position ID after manually verifying the broker position is flat
+        description: "For reconcile_flat: exact open reference ID; broker position must be checked first"
         type: string
         required: false
       alert_id:
-        description: Exact alert ID after checking the mailbox and verifying non-delivery
+        description: "For requeue_alert: exact event ID; mailbox non-delivery must be verified"
         type: string
         required: false
-      requeue_signal_key:
-        description: Optional previous dispatcher input; interpreted as an exact migrated alert ID
-        type: string
-        required: false
+  repository_dispatch:
+    types: [nifty-market-scan]
 
 permissions:
   contents: write
@@ -41,74 +36,97 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     environment: Production
-    timeout-minutes: 10
     env:
-      # Reuse v120.3 schema-7 state to preserve open lock and notification outbox.
       STATE_FILE: state/market_state_v120_3.json
       AUDIT_DIR: audit
+      NIFTY_SCANNER_CONFIG: ${{ vars.NIFTY_SCANNER_CONFIG }}
       NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
     steps:
-      - name: Checkout latest default branch
-        uses: actions/checkout@v5
+      - name: Checkout default branch (required for state consistency)
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Require default branch
+          persist-credentials: true
+
+      - name: Verify runner is at the default branch
+        id: runner_branch
         env:
-          CURRENT_REF: ${{ github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: test "$CURRENT_REF" = "$DEFAULT_BRANCH"
-      - name: Determine session date
-        id: session
-        run: echo "date=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
-      - name: Cache current-session futures master
-        uses: actions/cache@v5
-        with:
-          path: .cache/nifty_futures_v122_4.json
-          key: nifty-futures-v1224-1-${{ steps.session.outputs.date }}
-      - name: Check standalone release syntax
-        run: python -m py_compile market_scanner.py
-      - name: Initialize only after verifying flat
-        if: ${{ inputs.operation == 'initialize_flat' }}
-        run: python market_scanner.py --initialize-flat
-      - name: Migrate existing state without overwriting its source
-        if: ${{ inputs.operation == 'migrate_state' }}
-        env:
-          SOURCE_STATE: ${{ inputs.source_state }}
-        run: python market_scanner.py --migrate-state "$SOURCE_STATE"
-      - name: Reconcile a manually verified flat position
-        if: ${{ inputs.operation == 'reconcile_flat' }}
-        env:
-          POSITION_ID: ${{ inputs.position_id }}
-        run: python market_scanner.py --reconcile-flat "$POSITION_ID"
-      - name: Requeue a manually verified undelivered actionable alert
-        if: ${{ inputs.operation == 'requeue_alert' || inputs.requeue_signal_key != '' }}
-        env:
-          ALERT_ID: ${{ inputs.alert_id }}
-          LEGACY_ALERT_ID: ${{ inputs.requeue_signal_key }}
         shell: bash
         run: |
           set -euo pipefail
-          python market_scanner.py --requeue-alert "${ALERT_ID:-$LEGACY_ALERT_ID}"
-      - name: Run standalone v122.4.0 price-structure scanner and claim trade lifecycle alerts
-        id: scan
-        if: ${{ inputs.operation == 'scan' || inputs.operation == '' }}
+          test "$(git branch --show-current)" = "$DEFAULT_BRANCH"
+          git fetch origin "$DEFAULT_BRANCH"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)"
+
+      - name: Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify the scanner release and compile the runtime
+        id: release_check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python market_scanner.py --version)" = "126.0.0"
+          python -m py_compile market_scanner.py
+
+      - name: Initialize only after manual verified flat-state selection
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'initialize_flat' }}
+        env:
+          MANUAL_FLAT_CONFIRMED: '1'
+        run: python market_scanner.py --initialize-flat
+
+      - name: Non-destructive migration (destination must not exist)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'migrate_state' }}
+        env:
+          SOURCE_STATE: ${{ inputs.source_state }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_STATE"
+          python market_scanner.py --migrate-state "$SOURCE_STATE"
+
+      - name: Operator-verified reference lock reconciliation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'reconcile_flat' }}
+        env:
+          MANUAL_FLAT_CONFIRMED: '1'
+          POSITION_ID: ${{ inputs.position_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$POSITION_ID"
+          python market_scanner.py --reconcile-flat "$POSITION_ID"
+
+      - name: Operator-verified alert requeue (never automatic for uncertain SMTP)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'requeue_alert' }}
+        env:
+          MANUAL_ALERT_UNDELIVERED_CONFIRMED: '1'
+          ALERT_ID: ${{ inputs.alert_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ALERT_ID"
+          python market_scanner.py --requeue-alert "$ALERT_ID"
+
+      - name: One causal scan, persist all completed 1m evidence, claim actionable alerts
+        id: scan_run
+        if: ${{ github.event_name == 'repository_dispatch' || inputs.operation == 'scan' }}
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p audit
-          session_date="$(TZ=Asia/Kolkata date +%F)"
-          python market_scanner.py --scan-and-claim 2>&1 | tee -a "audit/worker_v122_4_${session_date}.log"
-      - name: Persist state, input evidence and alert claims
-        id: persist
-        if: ${{ always() }}
+          python market_scanner.py --scan-and-claim
+
+      # PHASE 1: commit/push evidence and claims before even considering SMTP.
+      - name: Persist state, journal, and recordings (fail closed on concurrent writes)
+        id: persist_scan
+        if: ${{ always() && steps.runner_branch.outcome == 'success' && steps.release_check.outcome == 'success' }}
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
@@ -116,67 +134,69 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if [[ -f state/market_state_v120_3.json ]]; then git add -f -- state/market_state_v120_3.json; fi
-          if [[ -d state/archives_v120_3 ]]; then git add -f -- state/archives_v120_3; fi
-          if [[ -d audit/inputs_v122_4 ]]; then git add -f -- audit/inputs_v122_4; fi
+          if [[ -f "$STATE_FILE" ]]; then git add -f -- "$STATE_FILE"; fi
           shopt -s nullglob
-          files=(audit/market_scan_v122_4_*.jsonl audit/worker_v122_4_*.log)
-          if (( ${#files[@]} )); then git add -f -- "${files[@]}"; fi
+          audits=(audit/market_scan_v126_*.jsonl)
+          if (( ${#audits[@]} )); then git add -f -- "${audits[@]}"; fi
+          if [[ -d audit/inputs_v126 ]]; then git add -f -- audit/inputs_v126; fi
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v122.4 state, recorded inputs and alert claims'
-            # Fail closed on concurrent branch updates. A rebase conflict leaves this
-            # step failed, so claimed notifications are not delivered from state that
-            # was not durably persisted to the default branch.
-            git fetch origin "${DEFAULT_BRANCH}"
-            git rebase "origin/${DEFAULT_BRANCH}"
+            git fetch origin "$DEFAULT_BRANCH"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || {
+              echo 'Concurrent branch update: refusing rebase of authoritative trading state' >&2
+              exit 1
+            }
+            git commit -m 'Persist v126 market evidence, position state and email claims'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
-      - name: Deliver durably claimed entries, targets, stops and exits
-        id: deliver
-        if: ${{ always() && steps.persist.outcome == 'success' && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure') }}
-        env:
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: '465'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -f state/market_state_v120_3.json ]]; then
-            echo 'CRITICAL: existing schema-7 state is missing; lifecycle alerts cannot be delivered.' >&2
-            exit 1
-          fi
-          if ! python - <<'PY'
-          from pathlib import Path
-          import importlib.util, sys
-          spec=importlib.util.spec_from_file_location('market_scanner_v122_runtime','market_scanner.py')
-          scanner=importlib.util.module_from_spec(spec);sys.modules[spec.name]=scanner;spec.loader.exec_module(scanner)
-          try:
-              scanner.load(Path('state/market_state_v120_3.json'))
-          except Exception as exc:
-              print(f'CRITICAL: existing state is unreadable; alert delivery failed: {type(exc).__name__}')
-              raise SystemExit(1)
-          PY
-          then
-            exit 1
-          fi
-          python market_scanner.py --deliver-claimed
-      - name: Persist delivery outcome
-        if: ${{ always() && steps.persist.outcome == 'success' && steps.deliver.outcome != 'skipped' }}
+
+      # PHASE 2: mark any claims DELIVERY_UNCERTAIN and COMMIT that to remote
+      # BEFORE the first SMTP socket. A crash cannot create automatic duplicate mail.
+      - name: Arm actionable email events, without connecting to SMTP
+        id: arm
+        if: ${{ always() && steps.persist_scan.outcome == 'success' && (github.event_name == 'repository_dispatch' || inputs.operation == 'scan') }}
+        run: python market_scanner.py --arm-delivery
+
+      - name: Persist armed SMTP uncertainty BEFORE sending
+        id: persist_arm
+        if: ${{ always() && steps.arm.outcome == 'success' }}
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f state/market_state_v120_3.json ]]; then
-            echo 'No existing schema-7 state file exists; nothing to persist after delivery.'
-            exit 0
-          fi
-          git add -f -- state/market_state_v120_3.json
+          git add -f -- "$STATE_FILE"
           if ! git diff --cached --quiet; then
-            git commit -m 'Persist NIFTY v122.4 entry, target and exit delivery outcomes'
-            git fetch origin "${DEFAULT_BRANCH}"
-            git rebase "origin/${DEFAULT_BRANCH}"
+            git fetch origin "$DEFAULT_BRANCH"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
+            git commit -m 'Arm v126 SMTP events durably before network I/O'
+            git push origin "HEAD:${DEFAULT_BRANCH}"
+          fi
+
+      - name: Deliver ONLY durably armed actionable events
+        id: deliver
+        if: ${{ always() && steps.persist_arm.outcome == 'success' }}
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: '465'
+        run: python market_scanner.py --deliver-armed
+
+      # PHASE 3: save SENT/UNCERTAIN outcome; uncertain items require an explicit
+      # mailbox review, not silent automatic retransmission.
+      - name: Persist SMTP outcomes even after delivery failure
+        if: ${{ always() && steps.persist_arm.outcome == 'success' && steps.deliver.outcome != 'skipped' }}
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -f -- "$STATE_FILE"
+          if ! git diff --cached --quiet; then
+            git fetch origin "$DEFAULT_BRANCH"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
+            git commit -m 'Persist v126 SMTP accepted/uncertain outcomes'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
