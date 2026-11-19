@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v126.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v127.0.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -9,7 +9,7 @@ The supplied OHLC workbooks support historical price validation. They contain
 no option OI snapshots or quotes. Exact historical strike decisions need
 timestamped option captures. The 1.80%–2.00% entry band is a strategy rule.
 """
-from __future__ import annotations
+from __future__ import annotatixons
 import argparse
 import copy
 import fcntl
@@ -34,7 +34,7 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '126.0.0'
+VERSION = '127.0.0'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -286,6 +286,21 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class TrendTransition:
+    side: int
+    level: float
+    detected_at: datetime
+
+
+@dataclass(frozen=True)
+class MarketPhase:
+    kind: str = 'MIXED'
+    reason: str = 'NO_ACCEPTED_STRUCTURE'
+    boundary: float | None = None
+    transition: TrendTransition | None = None
+
+
+@dataclass(frozen=True)
 class PriceContext:
     at: datetime
     atr: float
@@ -302,6 +317,7 @@ class PriceContext:
     recovery_level: float | None
     recovered_at: datetime | None
     last_established_side: int = 0
+    phase: MarketPhase = MarketPhase()
 
 
 def price_public(value) -> dict:
@@ -684,6 +700,128 @@ def reaction(bars: list[Candle], side: int, price: float, atr: float,
     return None
 
 
+def transition_retest(bars: list[Candle], threes: list[Candle], change: TrendTransition,
+                      atr: float, atr3: float) -> float | None:
+    """Accept a new trend after a completed, defended retest or a new 3m swing."""
+    side, level = change.side, change.level
+    post = [b for b in bars if b.start >= change.detected_at]
+    if len(post) >= 2:
+        test, confirm = post[-2:]
+        excursion = side * (edge_price(test, side) - level)
+        if (-.35 * atr <= excursion <= .42 * atr
+                and side * (test.close - level) >= 0
+                and side * (confirm.close - level) >= max(.55 * atr, .25 * atr3)
+                and side * (confirm.close - test.close) >= .20 * atr):
+            return edge_price(test, side)
+    completed = [b for b in threes if b.start >= change.detected_at]
+    for point in reversed(swings(completed, side, duration=3, left=1)):
+        if (side * (point.price - level) > .25 * atr
+                and side * (bars[-1].close - point.price) >= .8 * atr):
+            return point.price
+    return None
+
+
+def resolve_market_phase(bars: list[Candle], threes: list[Candle], previous: PriceContext | None,
+                         atr: float, atr3: float, impulse: int, bounds: tuple | None,
+                         signals: list[Signal], support_defended: bool,
+                         resistance_defended: bool) -> tuple[int, float | None, int, int,
+                                                              float | None, datetime | None, MarketPhase]:
+    """Resolve structural state independently of whether a particular entry is executable."""
+    last = bars[-1]
+    now = bar_end(last)
+    buffer = max(.6, .11 * atr)
+    trend = previous.trend if previous else 0
+    protected = previous.protected if previous else None
+    old_side = previous.last_established_side if previous else 0  # audit only
+    transition = previous.phase.transition if previous else None
+    retest_resolved = False
+
+    if trend and protected is not None and closes_through(bars, -trend, protected, buffer):
+        transition = TrendTransition(-trend, protected, now)
+        trend, protected = 0, None
+
+    if transition is not None:
+        new_stop = transition_retest(bars, threes, transition, atr, atr3)
+        if new_stop is not None:
+            trend, protected, transition = transition.side, new_stop, None
+            retest_resolved = True
+        elif closes_through(bars, -transition.side, transition.level, buffer):
+            # Failed acceptance stays mixed. The newly accepted side needs
+            # its own retest before either trend can be established again.
+            transition = TrendTransition(-transition.side, transition.level, now)
+    elif not trend and impulse and (previous is None or previous.recovery_side in (0, impulse)):
+        edge = edge_price(threes[-2], impulse)
+        if not closes_through(bars, -impulse, edge, buffer):
+            trend, protected = impulse, edge
+
+    if trend:
+        old_side = trend
+    if trend and protected is not None:
+        for point in reversed(swings(threes[-10:], trend, duration=3, left=1)):
+            if (trend * (point.price - protected) > buffer
+                    and trend * (last.close - point.price) > max(.9 * atr, .40 * atr3)):
+                protected = point.price
+                break
+
+    recovery_side = previous.recovery_side if previous else 0
+    recovery_level = previous.recovery_level if previous else None
+    recovered_at = previous.recovered_at if previous else None
+    if recovery_side and ((retest_resolved and trend == recovery_side)
+                          or closes_through(bars, -recovery_side, recovery_level, buffer)):
+        recovery_side, recovery_level, recovered_at = 0, None, None
+    elif recovery_side:
+        # A recovery is defended by its last confirmed swing after price has
+        # moved away. A shallow counter-move cannot invalidate the old base.
+        pivots = swings(threes[-12:], recovery_side, duration=3, left=1)
+        for point in reversed(pivots):
+            if (point.at >= recovered_at
+                    and recovery_side * (point.price - recovery_level) > buffer
+                    and recovery_side * (last.close - point.price) >= max(.85 * atr, .4 * atr3)):
+                recovery_level = point.price
+                if trend == recovery_side:
+                    recovery_side, recovery_level, recovered_at = 0, None, None
+                break
+
+    for side in (1, -1):
+        opposing_defense = support_defended if side == -1 else resistance_defended
+        if recovery_side == side or (trend == side and recovery_side != -side):
+            continue
+        qualified = [signal for signal in signals if signal.reversal is not None and signal.side == side
+                     and confirmed_reversal(signal, bars, atr)]
+        if recovery_side == -side and opposing_defense:
+            # A durable opposite reversal may replace the old recovery. A
+            # compact counter-move while its defended swing is close may not.
+            qualified = [signal for signal in qualified if is_zone_rotation(signal)
+                         and abs(last.close - recovery_level) > .55 * atr]
+        if qualified:
+            best = max(qualified, key=lambda signal: (signal.reversal.pattern == 'REPEATED_ZONE',
+                                                       signal.at, -side * signal.invalidation))
+            recovery_side, recovery_level, recovered_at = side, best.invalidation, now
+
+    if transition is not None:
+        edge = (max(b.high for b in bars) if transition.side == 1 else min(b.low for b in bars))
+        accepted = transition.side * (last.close - transition.level) > buffer
+        near_edge = abs(last.close - edge) <= .65 * atr
+        if accepted and near_edge:
+            reason = 'MIXED_NEAR_SESSION_HIGH' if transition.side == 1 else 'MIXED_NEAR_SESSION_LOW'
+        else:
+            reason = 'MIXED_PENDING_RETEST'
+        phase = MarketPhase('MIXED', reason, edge if near_edge and accepted else transition.level, transition)
+    elif recovery_side:
+        kind = 'BEARISH_TO_BULLISH' if recovery_side == 1 else 'BULLISH_TO_BEARISH'
+        phase = MarketPhase(kind, 'CONFIRMED_REVERSAL_STRUCTURE', recovery_level)
+    elif bounds is not None and support_defended and resistance_defended:
+        phase = MarketPhase('MIXED', 'MIXED_DEFENDED_RANGE')
+    elif trend:
+        kind = 'CONTINUOUS_BULLISH' if trend == 1 else 'CONTINUOUS_BEARISH'
+        phase = MarketPhase(kind, 'DEFENDED_TREND', protected)
+    elif bounds is not None:
+        phase = MarketPhase('MIXED', 'MIXED_DEFENDED_RANGE')
+    else:
+        phase = MarketPhase()
+    return trend, protected, old_side, recovery_side, recovery_level, recovered_at, phase
+
+
 def market_signals(bars: list[Candle], prior_ten: list[Candle], session_open: datetime,
                    previous: PriceContext | None,
                    reversals: SessionReversals) -> tuple[PriceContext, list[Signal]]:
@@ -697,29 +835,6 @@ def market_signals(bars: list[Candle], prior_ten: list[Candle], session_open: da
     resistances = observed_zones(bars, ten, prior_ten, -1, atr, session_open)
     buffer = max(.6, .11 * atr)
     impulse = trend_window(threes, atr)
-    trend = previous.trend if previous else 0
-    protected = previous.protected if previous else None
-    # Preserve a session thesis across a transition only when the opening and
-    # subsequent minute history are present. A recovered feed may begin in
-    # the middle of an opposing pullback.
-    complete_session = recent[0].start == session_open
-    last_established = (previous.last_established_side or trend) if previous and complete_session else 0
-    if trend and protected is not None and closes_through(recent, -trend, protected, buffer):
-        trend, protected = 0, None
-    may_establish = (last_established in (0, impulse)
-                     or bool(previous and previous.recovery_side == impulse))
-    if not trend and impulse and may_establish:
-        edge = threes[-2].low if impulse == 1 else threes[-2].high
-        if not closes_through(recent, -impulse, edge, buffer):
-            trend, protected = impulse, edge
-            if complete_session:
-                last_established = trend
-    if trend and protected is not None:
-        for point in reversed(swings(threes[-10:], trend, duration=3, left=1)):
-            if (trend * (point.price - protected) > buffer
-                    and trend * (last.close - point.price) > max(.9 * atr, .40 * atr3)):
-                protected = point.price
-                break
     bounds = range_bounds(recent, threes, ten, prior_ten, atr)
     side_zones = {1: supports, -1: resistances}
     results = reversals.advance(recent, atr)
@@ -739,17 +854,15 @@ def market_signals(bars: list[Candle], prior_ten: list[Candle], session_open: da
         return False
 
     support_defended, resistance_defended = nearby_defense(1), nearby_defense(-1)
-    recovery_side = previous.recovery_side if previous else 0
-    recovery_level = previous.recovery_level if previous else None
-    recovered_at = previous.recovered_at if previous else None
-    if recovery_side and (now - recovered_at > 14 * MINUTE or trend == recovery_side
-                          or closes_through(recent, -recovery_side, recovery_level, buffer)):
-        recovery_side, recovery_level, recovered_at = 0, None, None
+    trend, protected, last_established, recovery_side, recovery_level, recovered_at, phase = (
+        resolve_market_phase(recent, threes, previous, atr, atr3, impulse, bounds,
+                             results, support_defended, resistance_defended)
+    )
     if len(recent) < 5:
         context = PriceContext(now, atr, atr3,
                                volatility(ten, minimum=2.5), trend, protected, bounds,
                                supports, resistances, support_defended, resistance_defended,
-                               recovery_side, recovery_level, recovered_at, last_established)
+                               recovery_side, recovery_level, recovered_at, last_established, phase)
         return context, results
     penultimate = recent[-2]
 
@@ -761,12 +874,7 @@ def market_signals(bars: list[Candle], prior_ten: list[Candle], session_open: da
 
     for side in (1, -1):
         levels, opposing = side_zones[side], side_zones[-side]
-        for reversal in (row for row in results.copy() if row.reversal and row.side == side):
-            opposing_level = support_defended if side == -1 else resistance_defended
-            if (trend != side and recovery_side != side and not (recovery_side == -side and opposing_level)
-                    and confirmed_reversal(reversal, recent, atr)):
-                recovery_side, recovery_level, recovered_at = side, reversal.invalidation, now
-        protected_opposite = (trend or last_established) == -side and recovery_side != side
+        protected_opposite = trend == -side and recovery_side != side
         # A defended zone cannot be traded through on a single close. The double
         # test path still has to break its neckline and pass the live 3m gate.
         if protected_opposite:
@@ -842,7 +950,7 @@ def market_signals(bars: list[Candle], prior_ten: list[Candle], session_open: da
     context = PriceContext(now, atr, atr3,
                            volatility(ten, minimum=2.5), trend, protected, bounds,
                            supports, resistances, support_defended, resistance_defended,
-                           recovery_side, recovery_level, recovered_at, last_established)
+                           recovery_side, recovery_level, recovered_at, last_established, phase)
     return context, results
 
 
@@ -1781,6 +1889,7 @@ def price_history(bars: list[Candle], prior_ten: list[Candle],
                 live.setdefault(signal.identity, signal)
             examined.append({'at': previous.at.isoformat(), 'trend': previous.trend,
                              'protected': previous.protected, 'range': previous.range_bounds,
+                             'market_state': price_public(previous.phase),
                              'signals': [price_public(s) for s in signals]})
     assert previous is not None
     return previous, list(live.values()), jsonable(examined)
@@ -1791,7 +1900,15 @@ def safe_price_direction(signal: Signal, ctx: PriceContext, bars: list[Candle],
     side, atr = signal.side, ctx.atr
     reversal = signal.reversal is not None or signal.scenario in ('DOUBLE_BOTTOM', 'DOUBLE_TOP')
     failed = signal.scenario == 'FAILED_PULLBACK'
-    established = ctx.trend or ctx.last_established_side
+    transition = ctx.phase.transition
+    if transition is not None:
+        if not reversal or (transition.side == side and ctx.phase.reason in
+                            ('MIXED_NEAR_SESSION_HIGH', 'MIXED_NEAR_SESSION_LOW')):
+            return ctx.phase.reason
+    if ctx.phase.kind == 'MIXED' and signal.scenario in ('TREND_RESUMPTION', 'PULLBACK_CONTINUATION',
+                                                         'FAILED_PULLBACK'):
+        return ctx.phase.reason
+    established = ctx.trend
     if established == -side and not reversal and ctx.recovery_side != side:
         return 'OPPOSITE_PROTECTED_TREND'
     if reversal and established == -side and not confirmed_reversal(signal, bars, atr):
@@ -1927,8 +2044,6 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     if bars:
         result['candle_coverage'] = {'from': bars[0].start.isoformat(), 'through': through.isoformat(),
                                      'contiguous_tail': len(contiguous_tail(bars)), 'latest': latest}
-    if not active and (not latest or len(contiguous_tail(bars)) < 3):
-        return no_trade('LATEST_COMPLETED_CANDLES_UNAVAILABLE')
 
     early_baseline = max(day_time(now, 9, 18), session_open + 3 * MINUTE)
     if not active and now < early_baseline:
@@ -1956,25 +2071,27 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     window = None
     chain: list[dict] = []
     contracts: list[dict] = []
-    # Capture OI even while a strike is locked or before entry can be allowed.
-    # The baseline belongs to one exact price-window end.
-    if latest and through is not None and now < deadline:
+    # OI is an independent observation with its own receipt time and slot.
+    # Preserve the baseline even when this scan's price candle is late.
+    slot = expected
+    if now < deadline and slot >= early_baseline:
         try:
             expiry, contracts = api.contracts(now.date())
             chain = api.chain(expiry, contracts)
             now = clock()
-            if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != through:
+            if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != slot:
                 result['oi'] = {'status': 'CAPTURE_CROSSED_PRICE_WINDOW'}
             else:
-                sample = make_oi_snapshot(chain, expiry, now, through)
+                sample = make_oi_snapshot(chain, expiry, now, slot)
                 ring = engine['oi_samples']
                 window = match_oi(ring, sample, cfg)
                 ring = [s for s in ring if now - timestamp(s['at']) < 15 * MINUTE]
-                if not any(s['through'] == through.isoformat() and s['expiry'] == expiry for s in ring):
+                if not any(s['through'] == slot.isoformat() and s['expiry'] == expiry for s in ring):
                     ring.append(price_public(sample))
                 engine['oi_samples'] = ring[-8:]
                 result['oi'] = {'status': 'MATCHED' if window else 'OI_WINDOW_UNAVAILABLE',
-                                'at': now.isoformat(), 'through': through.isoformat(),
+                                'at': now.isoformat(), 'through': slot.isoformat(),
+                                'candle_through_at_capture': through.isoformat() if through else None,
                                 'expiry': expiry,
                                 'baseline': window.baseline.isoformat() if window else None,
                                 'matched_contracts': len(window.changes) if window else 0}
@@ -1985,6 +2102,26 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     if closed_before_capture:
         # A closing alert still leaves an OI baseline for the next scheduled run.
         return result, times
+
+    if not active and not latest and now - timestamp(times[0]) < timedelta(seconds=12):
+        # One repoll after the chain request. Never trade a rolled window.
+        if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == slot:
+            try:
+                raw = api.candles()
+                now = clock()
+                retry = [b for b in parse_candles(raw, now - timedelta(seconds=cfg.feed_grace_seconds - 1))
+                         if session_open <= b.start and bar_end(b) <= session_close]
+                if (retry and bar_end(retry[-1]) == slot
+                        and exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == slot):
+                    bars, through, latest = retry, slot, True
+                    result['candle_coverage'] = {'from': bars[0].start.isoformat(),
+                                                 'through': through.isoformat(), 'latest': True,
+                                                 'contiguous_tail': len(contiguous_tail(bars)),
+                                                 'recovered_on_repoll': True}
+            except (DataError, ProviderError) as exc:
+                result['candle_repoll_error'] = str(exc)
+    if not active and (not latest or len(contiguous_tail(bars)) < 3):
+        return no_trade('LATEST_COMPLETED_CANDLES_UNAVAILABLE')
 
     if active:
         if window and spot_for_management is not None and bars and managed['t1_hit']:
@@ -2037,6 +2174,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     result['price'] = {'atr_1m': context.atr, 'atr_3m': context.atr3, 'atr_10m': context.atr10,
                        'trend': context.trend, 'protected': context.protected, 'range': context.range_bounds,
                        'last_established_side': context.last_established_side,
+                       'market_state': price_public(context.phase),
                        'recovery_side': context.recovery_side, 'recovery_level': context.recovery_level,
                        'defended_support': context.defends_support,
                        'defended_resistance': context.defends_resistance,
@@ -2045,7 +2183,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         existing = 1 if rotation_from['direction'] == 'BULLISH' else -1
         signals = [signal for signal in signals if signal.side == -existing and is_zone_rotation(signal)]
     if not signals:
-        return no_trade('NO_FRESH_PRICE_TRIGGER')
+        return no_trade(context.phase.reason if context.phase.transition else 'NO_FRESH_PRICE_TRIGGER')
     if window is None:
         return no_trade('OI_WINDOW_UNAVAILABLE')
     if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != through:
@@ -2121,6 +2259,9 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
             details['plan'] = asdict(plan)
             eligible.append((signal, plan, candidates, details))
     if not eligible:
+        reasons = {item['reason'] for item in result['evaluations']}
+        if context.phase.kind == 'MIXED' and reasons == {context.phase.reason}:
+            return no_trade(context.phase.reason)
         return no_trade('PRICE_OI_OR_RISK_REQUIREMENTS_NOT_MET')
     if len({signal.side for signal, *_ in eligible}) > 1:
         return no_trade('CONFLICTING_QUALIFIED_DIRECTIONS')
@@ -2310,24 +2451,24 @@ def recorded_scan(state:dict,provider, cfg:Config, audit_dir:Path,token:str, rep
             run_id=os.environ.get('GITHUB_RUN_ID','local')+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1')
             captured_at=now.strftime('%H%M%S-%f')
             safe=''.join(x if x.isalnum() or x in '-_' else '_' for x in run_id)
-            file=audit_dir/'inputs_v126'/session_date/(captured_at+'-'+safe+'.json.gz')
+            file=audit_dir/'inputs_v127'/session_date/(captured_at+'-'+safe+'.json.gz')
             record_inputs(file,raw)
             event['input_recording']=str(file)
     if result.get('reason') != 'AFTER_SESSION_EXIT_CUTOFF' or event['alerts_pending']:
-        append_audit(audit_dir/('market_scan_v126_'+now.date().isoformat()+'.jsonl'), event)
+        append_audit(audit_dir/('market_scan_v127_'+now.date().isoformat()+'.jsonl'), event)
     if failure:
         result['audit_recorded']=True
     return result
 
 
 def replay_recordings(directory:Path, cfg:Config, output:Path) -> int:
-    """Replay v126 recordings in the inputs_v126 directory.
+    """Replay v127 recordings in the inputs_v127 directory.
 
     Mismatched API call sequences fail rather than silently substituting a
     future price, date, quote, or contract not captured at that decision time.
     """
     files=sorted(directory.rglob('*.json.gz'))
-    if not files:raise ScannerError('NO_V126_CAPTURED_INPUTS_FOUND')
+    if not files:raise ScannerError('NO_V127_CAPTURED_INPUTS_FOUND')
     records=[]
     last_at=None
     for file in files:
@@ -2391,8 +2532,8 @@ def main(argv=None):
     action.add_argument('--reconcile-flat',metavar='POSITION_ID')
     action.add_argument('--requeue-alert',metavar='ALERT_ID')
     action.add_argument('--migrate-state',metavar='SOURCE')
-    action.add_argument('--replay-recordings',metavar='DIR', help='Replay recorded v126 price and OI inputs')
-    parser.add_argument('--replay-report',default='audit/replay_v126.json')
+    action.add_argument('--replay-recordings',metavar='DIR', help='Replay recorded v127 price and OI inputs')
+    parser.add_argument('--replay-report',default='audit/replay_v127.json')
     args=parser.parse_args(argv)
     if args.version:print(VERSION);return 0
     try:
@@ -2424,7 +2565,7 @@ def main(argv=None):
                 state['history'].append(closed);state['position']=None
                 state['last_exit']={'at':closed['closed_at'],'direction':closed['direction'],'id':closed['id']}
                 save_state(state_path,state)
-                append_audit(audit_dir/('market_scan_v126_'+datetime.now(IST).date().isoformat()+'.jsonl'),
+                append_audit(audit_dir/('market_scan_v127_'+datetime.now(IST).date().isoformat()+'.jsonl'),
                              {'event':'MANUAL_RECONCILIATION','position_id':p['id'],'at':closed['closed_at']})
                 print(json.dumps({'status':'REFERENCE_LOCK_RECONCILED','position_id':p['id']}));return 0
             if args.requeue_alert:
