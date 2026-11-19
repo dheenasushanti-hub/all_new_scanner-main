@@ -9,7 +9,7 @@ The supplied OHLC workbooks support historical price validation. They contain
 no option OI snapshots or quotes. Exact historical strike decisions need
 timestamped option captures. The 1.80%–2.00% entry band is a strategy rule.
 """
-from __future__ import annotatixons
+from __future__ import annotations
 import argparse
 import copy
 import fcntl
