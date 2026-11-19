@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v127.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v128.0.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -8,6 +8,11 @@ durable outbox retains position and delivery identity across workflow reruns.
 The supplied OHLC workbooks support historical price validation. They contain
 no option OI snapshots or quotes. Exact historical strike decisions need
 timestamped option captures. The 1.80%–2.00% entry band is a strategy rule.
+
+Price analysis uses available closed one-minute candles. A one-minute
+publication lag can qualify for entry only with a recent trigger, a matched
+three-minute OI observation and a quote from the decision minute. Position
+monitoring uses completed candles and fresh index quotes independently.
 """
 from __future__ import annotations
 import argparse
@@ -34,7 +39,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '127.0.0'
+VERSION = '128.0.0'
+AUDIT_RELEASE = 'v128'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -131,12 +137,12 @@ def parse_candles(raw: list, now: datetime) -> list[Candle]:
             start = timestamp(row[0])
             if start.second or start.microsecond:
                 raise DataError('Unaligned candle')
+            if start + timedelta(minutes=1) > now - timedelta(seconds=1):
+                continue
             c = Candle(start,*(read_number(row[i],f'candle_{i}',positive=True) for i in range(1,5)),
                        read_number(row[5], 'volume',nonnegative=True) if len(row)>5 else 0.0)
         except (DataError,TypeError) as exc:
             raise DataError('Invalid OHLC row') from exc
-        if c.start + timedelta(minutes=1) > now - timedelta(seconds=1):
-            continue
         if c.start in unique and c != unique[c.start]:
             raise DataError('Conflicting duplicate candles')
         unique[c.start] = c
@@ -203,6 +209,9 @@ class Config:
 
 MINUTE = timedelta(minutes=1)
 OI_MINUTES = 3
+MAX_ENTRY_CANDLE_LAG = MINUTE
+MAX_TRIGGER_AGE = 2 * MINUTE
+CANDLE_REFRESH_REQUEST_BUDGET = timedelta(seconds=16)
 # Separate from strike eligibility. Used when judging changes in the OI map.
 OI_LEVEL_MATERIAL_CHANGE = .02
 CONTINUATION_SCENARIOS = frozenset({'FAILED_PULLBACK', 'PULLBACK_CONTINUATION', 'TREND_RESUMPTION',
@@ -211,6 +220,46 @@ CONTINUATION_SCENARIOS = frozenset({'FAILED_PULLBACK', 'PULLBACK_CONTINUATION', 
 
 def bar_end(bar: Candle, duration: int = 1) -> datetime:
     return bar.start + duration * MINUTE
+
+
+@dataclass(frozen=True)
+class ClosedPrice:
+    bars: list[Candle]
+
+    @property
+    def through(self) -> datetime | None:
+        return bar_end(self.bars[-1]) if self.bars else None
+
+    @property
+    def tail_size(self) -> int:
+        return len(contiguous_tail(self.bars))
+
+    def covers_entry(self, slot: datetime) -> bool:
+        through = self.through
+        return through is not None and timedelta(0) <= slot - through <= MAX_ENTRY_CANDLE_LAG
+
+    def audit(self, slot: datetime) -> dict:
+        through = self.through
+        return {
+            'from': self.bars[0].start.isoformat() if self.bars else None,
+            'through': through.isoformat() if through else None,
+            'expected_through': slot.isoformat(),
+            'lag_minutes': (slot - through) // MINUTE if through else None,
+            'contiguous_tail': self.tail_size,
+            'latest': through == slot,
+        }
+
+
+def merge_closed_price(saved: ClosedPrice, raw: list, received_at: datetime,
+                       session: tuple[datetime, datetime], cfg: Config) -> ClosedPrice:
+    session_open, session_close = session
+    observed = parse_candles(raw, received_at - timedelta(seconds=cfg.feed_grace_seconds - 1))
+    observed = [bar for bar in observed if session_open <= bar.start and bar_end(bar) <= session_close]
+    # Responses can be partial or out of order. Supplement recorded evidence
+    # by timestamp while retaining the latest provider correction for a bar.
+    by_start = {bar.start: bar for bar in saved.bars}
+    by_start.update((bar.start, bar) for bar in observed)
+    return ClosedPrice(sorted(by_start.values(), key=lambda bar: bar.start))
 
 
 def aggregate(bars: list[Candle], duration: int, session_open: datetime) -> list[Candle]:
@@ -1314,7 +1363,8 @@ class Upstox:
 
     def get(self, path: str, params: dict | None=None):
         url = 'https://api.upstox.com' + path + ('?' + urlencode(params) if params else '')
-        req = Request(url, headers={'Authorization': 'Bearer ' + self._token, 'Accept': 'application/json', 'User-Agent': 'nifty-scanner/124.0'})
+        req = Request(url, headers={'Authorization': 'Bearer ' + self._token, 'Accept': 'application/json',
+                                    'User-Agent': 'nifty-scanner/' + VERSION})
         for attempt in range(2):
             try:
                 with urlopen(req, timeout=7) as r:
@@ -1701,6 +1751,14 @@ def checked_quote(q:dict|None,now:datetime,max_age:float,field='last_price')->fl
     return price
 
 
+def position_spot(quotes: dict, position: dict, now: datetime, cfg: Config) -> float:
+    quote = quotes.get(INDEX)
+    spot = checked_quote(quote, now, cfg.quote_max_age_seconds)
+    if timestamp(quote['timestamp']) < timestamp(position['opened_at']):
+        raise DataError('INDEX_QUOTE_PREDATES_POSITION')
+    return spot
+
+
 # ----------------------- Chronological position management -----------------
 
 def position_event_payload(p:dict,now:datetime,**more):
@@ -2028,22 +2086,33 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         return no_trade('NO_VERIFIED_NFO_SESSION')
     session_open, session_close = session
     deadline = min(deadline, session_close)
-    bars = []
-    try:
-        raw = api.candles()
-        now = clock()
-        bars = [b for b in parse_candles(raw, now - timedelta(seconds=cfg.feed_grace_seconds - 1))
-                if session_open <= b.start and bar_end(b) <= session_close]
-    except (DataError, ProviderError) as exc:
-        now = clock()
-        result['candle_error'] = str(exc)
+    price = ClosedPrice([])
+    if engine.get('closed_candles'):
+        try:
+            price = merge_closed_price(price, engine['closed_candles'], now, session, cfg)
+        except DataError as exc:
+            result['candle_cache_error'] = str(exc)
 
-    expected = exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds))
-    through = bar_end(bars[-1]) if bars else None
-    latest = through == expected
-    if bars:
-        result['candle_coverage'] = {'from': bars[0].start.isoformat(), 'through': through.isoformat(),
-                                     'contiguous_tail': len(contiguous_tail(bars)), 'latest': latest}
+    def price_slot(at: datetime) -> datetime:
+        return exact_minute(at - timedelta(seconds=cfg.feed_grace_seconds))
+
+    def refresh_price(error_field: str):
+        nonlocal now, price
+        try:
+            raw = api.candles()
+        except (DataError, ProviderError) as exc:
+            now = clock()
+            result[error_field] = str(exc)
+            return
+        now = clock()
+        try:
+            price = merge_closed_price(price, raw, now, session, cfg)
+        except DataError as exc:
+            result[error_field] = str(exc)
+
+    refresh_price('candle_error')
+    result['candle_coverage'] = price.audit(price_slot(now))
+    engine['closed_candles'] = [serialize_bar(bar) for bar in price.bars]
 
     early_baseline = max(day_time(now, 9, 18), session_open + 3 * MINUTE)
     if not active and now < early_baseline:
@@ -2057,12 +2126,12 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         try:
             quotes = api.quotes([INDEX])
             now = clock()
-            spot_for_management = checked_quote(quotes.get(INDEX), now, cfg.quote_max_age_seconds)
+            spot_for_management = position_spot(quotes, active, now, cfg)
         except (DataError, ProviderError, KeyError) as exc:
             now = clock()
             result['quote_error'] = str(exc)
         managed, management_events, closed, management_warnings = manage_reference(
-            active, bars, spot_for_management, now, deadline, cfg
+            active, price.bars, spot_for_management, now, deadline, cfg
         )
         if closed is not None:
             save_position(managed, management_events, closed, management_warnings, at=now)
@@ -2071,16 +2140,17 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     window = None
     chain: list[dict] = []
     contracts: list[dict] = []
-    # OI is an independent observation with its own receipt time and slot.
-    # Preserve the baseline even when this scan's price candle is late.
-    slot = expected
+    # Index candles and OI have independent publication and receipt times.
+    # Stamp each snapshot at receipt, even if a candle or a network call crossed a minute.
+    slot = price_slot(now)
     if now < deadline and slot >= early_baseline:
         try:
             expiry, contracts = api.contracts(now.date())
             chain = api.chain(expiry, contracts)
             now = clock()
-            if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != slot:
-                result['oi'] = {'status': 'CAPTURE_CROSSED_PRICE_WINDOW'}
+            slot = price_slot(now)
+            if now >= deadline:
+                result['oi'] = {'status': 'CAPTURE_AFTER_SESSION_EXIT_CUTOFF'}
             else:
                 sample = make_oi_snapshot(chain, expiry, now, slot)
                 ring = engine['oi_samples']
@@ -2091,7 +2161,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
                 engine['oi_samples'] = ring[-8:]
                 result['oi'] = {'status': 'MATCHED' if window else 'OI_WINDOW_UNAVAILABLE',
                                 'at': now.isoformat(), 'through': slot.isoformat(),
-                                'candle_through_at_capture': through.isoformat() if through else None,
+                                'candle_through_at_capture': price.through.isoformat() if price.through else None,
                                 'expiry': expiry,
                                 'baseline': window.baseline.isoformat() if window else None,
                                 'matched_contracts': len(window.changes) if window else 0}
@@ -2099,47 +2169,41 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
             now = clock()
             result['oi'] = {'status': 'OPTION_CHAIN_UNAVAILABLE', 'reason': str(exc)}
 
-    if closed_before_capture:
-        # A closing alert still leaves an OI baseline for the next scheduled run.
-        return result, times
+    if window is None:
+        slot = price_slot(now)
+    repolled = False
+    slot_ends = slot + MINUTE + timedelta(seconds=cfg.feed_grace_seconds)
+    if (not active and price.through != slot and price_slot(now) == slot
+            and now + CANDLE_REFRESH_REQUEST_BUDGET < min(slot_ends, deadline)):
+        # The chain request already gave the feed time to publish. Use one
+        # opportunistic refresh, then work from the available closed evidence.
+        refresh_price('candle_repoll_error')
+        repolled = True
+        engine['closed_candles'] = [serialize_bar(bar) for bar in price.bars]
+    bars = price.bars
+    through = price.through
+    entry_slot = slot if window is not None else price_slot(now)
+    result['candle_coverage'] = price.audit(entry_slot)
+    if repolled:
+        result['candle_coverage']['recovered_on_repoll'] = through == entry_slot
 
-    if not active and not latest and now - timestamp(times[0]) < timedelta(seconds=12):
-        # One repoll after the chain request. Never trade a rolled window.
-        if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == slot:
-            try:
-                raw = api.candles()
-                now = clock()
-                retry = [b for b in parse_candles(raw, now - timedelta(seconds=cfg.feed_grace_seconds - 1))
-                         if session_open <= b.start and bar_end(b) <= session_close]
-                if (retry and bar_end(retry[-1]) == slot
-                        and exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == slot):
-                    bars, through, latest = retry, slot, True
-                    result['candle_coverage'] = {'from': bars[0].start.isoformat(),
-                                                 'through': through.isoformat(), 'latest': True,
-                                                 'contiguous_tail': len(contiguous_tail(bars)),
-                                                 'recovered_on_repoll': True}
-            except (DataError, ProviderError) as exc:
-                result['candle_repoll_error'] = str(exc)
-    if not active and (not latest or len(contiguous_tail(bars)) < 3):
-        return no_trade('LATEST_COMPLETED_CANDLES_UNAVAILABLE')
-
-    if active:
+    if active and not closed_before_capture:
         if window and spot_for_management is not None and bars and managed['t1_hit']:
             try:
                 fresh = api.quotes([INDEX])
                 now = clock()
-                fresh_spot = checked_quote(fresh.get(INDEX), now, cfg.quote_max_age_seconds)
+                fresh_spot = position_spot(fresh, managed, now, cfg)
                 managed, extra, closed, warnings = manage_reference(managed, bars, fresh_spot, now, deadline, cfg)
                 management_events.extend(extra)
                 management_warnings.extend(warnings)
-                if managed is not None and exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == through:
+                if managed is not None and price.covers_entry(price_slot(now)) and price_slot(now) == entry_slot:
                     management_events.extend(refine_reference(managed, bars, fresh_spot, window, now,
                                                               session_open=session_open))
             except (DataError, ProviderError, KeyError) as exc:
                 now = clock()
                 result['refinement_error'] = str(exc)
         elif (spot_for_management is not None and bars and managed['t1_hit']
-              and exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) == through
+              and price.covers_entry(price_slot(now))
               and now < deadline):
             management_events.extend(refine_reference(managed, bars, spot_for_management, None, now,
                                                       session_open=session_open))
@@ -2150,43 +2214,57 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         save_position(managed, management_events, closed, management_warnings, at=now)
         if managed is not None and spot_for_management is None and not bars:
             result.update(decision='POSITION_MONITORING_UNAVAILABLE', reason='PRICE_FEED_UNAVAILABLE')
-        if managed is None or not managed['t1_hit'] or not window or not latest or spot_for_management is None:
-            return result, times
         # A reversal can replace only the remainder of a trade that already
         # realized T1. Leave that position intact unless the new contract,
         # price, OI and risk all qualify in the same observation.
-        rotation_from = managed
+        if managed is not None and managed['t1_hit'] and window and spot_for_management is not None:
+            rotation_from = managed
+
+    # Market state is an observation in its own right, even when OI, quote,
+    # time or an existing position prevents a new entry.
+    signals = []
+    if bars:
+        prior_ten = prior_context(engine, api, now)
+        now = clock()
+        context, signals, recent = price_history(bars, prior_ten, session_open)
+        result['price'] = {'as_of': context.at.isoformat(),
+                           'atr_1m': context.atr, 'atr_3m': context.atr3, 'atr_10m': context.atr10,
+                           'trend': context.trend, 'protected': context.protected, 'range': context.range_bounds,
+                           'last_established_side': context.last_established_side,
+                           'market_state': price_public(context.phase),
+                           'recovery_side': context.recovery_side, 'recovery_level': context.recovery_level,
+                           'defended_support': context.defends_support,
+                           'defended_resistance': context.defends_resistance,
+                           'observations': recent}
+    if active and rotation_from is None:
+        return result, times
 
     if now < max(day_time(now, *ENTRY_START), session_open+6*MINUTE):
         return no_trade('COLLECTING_OPENING_BASELINE')
     last_entry = min(day_time(now, *ENTRY_END), deadline - 10*MINUTE)
     if now >= last_entry:
         return no_trade('OUTSIDE_ENTRY_WINDOW')
-    if len(contiguous_tail(bars)) < 6:
+    if not bars:
+        return no_trade('NO_COMPLETED_SESSION_CANDLES')
+    if not price.covers_entry(entry_slot):
+        return no_trade('CLOSED_PRICE_TOO_OLD_FOR_ENTRY')
+    if price.tail_size < 6:
         return no_trade('INSUFFICIENT_CONTIGUOUS_PRICE_HISTORY')
     last_exit = state.get('last_exit')
     if last_exit and now - timestamp(last_exit['at']) < cfg.cooldown_minutes * MINUTE:
         return no_trade('POST_EXIT_COOLDOWN')
 
-    prior_ten = prior_context(engine, api, now)
-    now = clock()
-    context, signals, recent = price_history(bars, prior_ten, session_open)
-    result['price'] = {'atr_1m': context.atr, 'atr_3m': context.atr3, 'atr_10m': context.atr10,
-                       'trend': context.trend, 'protected': context.protected, 'range': context.range_bounds,
-                       'last_established_side': context.last_established_side,
-                       'market_state': price_public(context.phase),
-                       'recovery_side': context.recovery_side, 'recovery_level': context.recovery_level,
-                       'defended_support': context.defends_support,
-                       'defended_resistance': context.defends_resistance,
-                       'observations': recent}
     if rotation_from is not None:
         existing = 1 if rotation_from['direction'] == 'BULLISH' else -1
         signals = [signal for signal in signals if signal.side == -existing and is_zone_rotation(signal)]
     if not signals:
         return no_trade(context.phase.reason if context.phase.transition else 'NO_FRESH_PRICE_TRIGGER')
+    signals = [signal for signal in signals if timedelta(0) <= entry_slot - signal.at <= MAX_TRIGGER_AGE]
+    if not signals:
+        return no_trade('PRICE_TRIGGER_EXPIRED')
     if window is None:
         return no_trade('OI_WINDOW_UNAVAILABLE')
-    if exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != through:
+    if price_slot(now) != entry_slot:
         return no_trade('PRICE_WINDOW_ROLLED_DURING_SNAPSHOT')
 
     preliminary = bars[-1].close
@@ -2205,7 +2283,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         result['quote_error'] = str(exc)
         return no_trade('ENTRY_QUOTE_REQUEST_FAILED')
     now = clock()
-    if now >= last_entry or exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds)) != through:
+    if now >= last_entry or price_slot(now) != entry_slot:
         return no_trade('DECISION_WINDOW_EXPIRED_DURING_QUOTE_FETCH')
     quote = quotes.get(INDEX)
     try:
@@ -2213,8 +2291,13 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         quote_time = timestamp(quote['timestamp'])
     except (DataError, KeyError):
         return no_trade('INDEX_QUOTE_UNAVAILABLE')
-    if quote_time < through - timedelta(seconds=2):
-        return no_trade('INDEX_QUOTE_PREDATES_PRICE_WINDOW')
+    if quote_time < entry_slot:
+        return no_trade('INDEX_QUOTE_PREDATES_DECISION_WINDOW')
+    result['entry_evidence'] = {'index_quote_at': quote_time.isoformat(),
+                                'index_quote': spot,
+                                'decision_through': entry_slot.isoformat(),
+                                'candle_through': through.isoformat(),
+                                'candle_lag_minutes': (entry_slot - through) // MINUTE}
 
     front = {r['instrument_key']: r for r in chain}
     consumed = engine['consumed_signals']
@@ -2302,7 +2385,8 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
             engine['consumed_signals'] = (consumed + [s.identity for s, *_ in eligible])[-160:]
             event_id = new_event(state, 'ENTRY', position_event_payload(
                 position, now, reason='QUALIFIED_PRICE_AND_3M_OI', signal=price_public(signal),
-                plan=asdict(plan), oi={'window': result['oi'], 'contract': contract,
+                plan=asdict(plan), entry_evidence=result['entry_evidence'],
+                oi={'window': result['oi'], 'contract': contract,
                                       'entry_threshold': details['oi_entry_threshold'],
                                       'price_levels': details['oi_structure']}), now)
             result['alerts_created'].append(event_id)
@@ -2336,12 +2420,15 @@ def mail_content(event:dict) -> tuple[str,str]:
            f'Effective session cutoff: {d.get("effective_at")}', 
            f'Signal: {json.dumps(d.get("signal",{}),sort_keys=True)}',
            f'Execution/risk plan: {json.dumps(d.get("plan",{}),sort_keys=True)}',
-           f'OI context: {json.dumps(d.get("oi",{}),sort_keys=True)}',
-                      '',
-           'REFERENCE ALERT ONLY. No broker order was placed or confirmed.',
+           f'OI context: {json.dumps(d.get("oi",{}),sort_keys=True)}']
+    if evidence := d.get('entry_evidence'):
+        lines.extend([f'Closed candles through: {evidence["candle_through"]}',
+                      f'Index quote at: {evidence["index_quote_at"]}',
+                      f'Candle publication lag: {evidence["candle_lag_minutes"]} min'])
+    lines.extend(['', 'REFERENCE ALERT ONLY. No broker order was placed or confirmed.',
            'Stops and targets are underlying index reference levels, not option premium stop orders.',
            'Candle OHLC cannot prove intrabar order or the price at which a user could have filled.',
-           'Uncertain delivery needs explicit mailbox verification before a manual retry.']
+           'Uncertain delivery needs explicit mailbox verification before a manual retry.'])
     return subject,'\n'.join(lines)
 
 
@@ -2451,24 +2538,24 @@ def recorded_scan(state:dict,provider, cfg:Config, audit_dir:Path,token:str, rep
             run_id=os.environ.get('GITHUB_RUN_ID','local')+'-'+os.environ.get('GITHUB_RUN_ATTEMPT','1')
             captured_at=now.strftime('%H%M%S-%f')
             safe=''.join(x if x.isalnum() or x in '-_' else '_' for x in run_id)
-            file=audit_dir/'inputs_v127'/session_date/(captured_at+'-'+safe+'.json.gz')
+            file=audit_dir/('inputs_'+AUDIT_RELEASE)/session_date/(captured_at+'-'+safe+'.json.gz')
             record_inputs(file,raw)
             event['input_recording']=str(file)
     if result.get('reason') != 'AFTER_SESSION_EXIT_CUTOFF' or event['alerts_pending']:
-        append_audit(audit_dir/('market_scan_v127_'+now.date().isoformat()+'.jsonl'), event)
+        append_audit(audit_dir/(f'market_scan_{AUDIT_RELEASE}_{now.date().isoformat()}.jsonl'), event)
     if failure:
         result['audit_recorded']=True
     return result
 
 
 def replay_recordings(directory:Path, cfg:Config, output:Path) -> int:
-    """Replay v127 recordings in the inputs_v127 directory.
+    """Replay recordings produced by this release.
 
     Mismatched API call sequences fail rather than silently substituting a
     future price, date, quote, or contract not captured at that decision time.
     """
     files=sorted(directory.rglob('*.json.gz'))
-    if not files:raise ScannerError('NO_V127_CAPTURED_INPUTS_FOUND')
+    if not files:raise ScannerError('NO_CAPTURED_INPUTS_FOUND_FOR_'+AUDIT_RELEASE.upper())
     records=[]
     last_at=None
     for file in files:
@@ -2532,8 +2619,8 @@ def main(argv=None):
     action.add_argument('--reconcile-flat',metavar='POSITION_ID')
     action.add_argument('--requeue-alert',metavar='ALERT_ID')
     action.add_argument('--migrate-state',metavar='SOURCE')
-    action.add_argument('--replay-recordings',metavar='DIR', help='Replay recorded v127 price and OI inputs')
-    parser.add_argument('--replay-report',default='audit/replay_v127.json')
+    action.add_argument('--replay-recordings',metavar='DIR', help=f'Replay recorded {AUDIT_RELEASE} price and OI inputs')
+    parser.add_argument('--replay-report',default=f'audit/replay_{AUDIT_RELEASE}.json')
     args=parser.parse_args(argv)
     if args.version:print(VERSION);return 0
     try:
@@ -2565,7 +2652,7 @@ def main(argv=None):
                 state['history'].append(closed);state['position']=None
                 state['last_exit']={'at':closed['closed_at'],'direction':closed['direction'],'id':closed['id']}
                 save_state(state_path,state)
-                append_audit(audit_dir/('market_scan_v127_'+datetime.now(IST).date().isoformat()+'.jsonl'),
+                append_audit(audit_dir/(f'market_scan_{AUDIT_RELEASE}_{datetime.now(IST).date().isoformat()}.jsonl'),
                              {'event':'MANUAL_RECONCILIATION','position_id':p['id'],'at':closed['closed_at']})
                 print(json.dumps({'status':'REFERENCE_LOCK_RECONCILED','position_id':p['id']}));return 0
             if args.requeue_alert:
