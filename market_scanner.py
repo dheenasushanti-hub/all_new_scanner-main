@@ -1644,11 +1644,15 @@ def ensure_engine(state: dict, now: datetime) -> dict:
 def new_event(state:dict,kind:str,details:dict,now:datetime) -> str:
     if kind not in ALERT_KINDS:raise ScannerError('Non-actionable alert kind')
     details=copy.deepcopy(details)
+    email_observation = details.pop('email_observation', None)
     digest=hashlib.sha256(json.dumps([kind,details],sort_keys=True,allow_nan=False,
                                       separators=(',',':')).encode()).hexdigest()[:24]
     if not any(e['id']==digest for e in state['outbox']):
-        state['outbox'].append({'id':digest,'kind':kind,'details':details,
-                                'created_at':now.isoformat(),'status':'PENDING'})
+        event = {'id': digest, 'kind': kind, 'details': details,
+                 'created_at': now.isoformat(), 'status': 'PENDING'}
+        if email_observation is not None:
+            event['email_observation'] = email_observation
+        state['outbox'].append(event)
     return digest
 
 
@@ -1790,13 +1794,17 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
     def emit(kind, at, **fields):
         alerts.append((kind, position_event_payload(position, at, **fields)))
 
-    def finish(kind, at, reason, value, source):
-        emit(kind, at, reason=reason, underlying_reference=value, source=source)
+    def finish(kind, at, reason, value, source, email_observation=None):
+        if email_observation is None:
+            email_observation = {'spot': value}
+        emit(kind, at, reason=reason, underlying_reference=value, source=source,
+             email_observation=email_observation)
         return None, alerts, close_reference(position, at, reason, value, source), warnings
 
-    def hit_t1(at, source):
+    def hit_t1(at, source, email_observation):
         position.update(t1_hit=True, t1_at=at.isoformat(), remaining_pct=100-position.get('t1_exit_pct', 50))
-        emit('T1', at, source=source, underlying_reference=position['t1'])
+        emit('T1', at, source=source, underlying_reference=position['t1'],
+             email_observation=email_observation)
 
     entry_minute = exact_minute(opening)
     expected = max(cursor, entry_minute) + MINUTE
@@ -1815,12 +1823,15 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         if position.get('adjusted_at') and bar.start < timestamp(position['adjusted_at']):
             stop = position.get('stop_before_adjustment', stop)
             t2 = position.get('t2_before_adjustment', t2)
+        candle_observation = {'spot': bar.close, 'spot_is_close': True, 'stop': stop, 't2': t2}
         if side * (adverse - stop) <= 0:
-            return finish('EXIT', at, 'STRUCTURAL_SL', stop, 'COMPLETED_1M_STOP_FIRST')
+            return finish('EXIT', at, 'STRUCTURAL_SL', stop, 'COMPLETED_1M_STOP_FIRST',
+                          candle_observation)
         if not position['t1_hit'] and side * (favorable - position['t1']) >= 0:
-            hit_t1(at, 'COMPLETED_1M_HIGH_LOW')
+            hit_t1(at, 'COMPLETED_1M_HIGH_LOW', candle_observation)
         if position['t1_hit'] and side * (favorable - t2) >= 0:
-            return finish('T2', at, 'OI_TARGET_REACHED', t2, 'COMPLETED_1M_HIGH_LOW')
+            return finish('T2', at, 'OI_TARGET_REACHED', t2, 'COMPLETED_1M_HIGH_LOW',
+                          candle_observation)
         position['last_candle'] = bar.start.isoformat()
         expected += MINUTE
 
@@ -1831,7 +1842,7 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         if side * (spot - position['stop']) <= 0:
             return finish('EXIT', now, 'STRUCTURAL_SL', spot, 'FRESH_INDEX_QUOTE')
         if not position['t1_hit'] and side * (spot - position['t1']) >= 0:
-            hit_t1(now, 'FRESH_INDEX_QUOTE')
+            hit_t1(now, 'FRESH_INDEX_QUOTE', {'spot': spot})
         if position['t1_hit'] and side * (spot - position['t2']) >= 0:
             return finish('T2', now, 'OI_TARGET_REACHED', spot, 'FRESH_INDEX_QUOTE')
     return position, alerts, None, warnings
@@ -1907,7 +1918,8 @@ def refine_reference(position: dict, bars: list[Candle], spot: float,
         position, now, reason=reason,
         old_stop=old_stop, new_stop=position['stop'], old_t2=old_t2, new_t2=position['t2'],
         stop_swing=price_public(pivot) if continuation and pivot and position['stop'] != old_stop else None,
-        oi_snapshot_at=window.snapshot.at.isoformat() if window else None))]
+        oi_snapshot_at=window.snapshot.at.isoformat() if window else None,
+        email_observation={'spot': spot}))]
 
 
 def prior_context(engine: dict, api, now: datetime) -> list[Candle]:
@@ -2396,40 +2408,79 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     return no_trade('NO_LIQUID_CONTRACT_IN_OI_RANKING')
 
 
-def mail_content(event:dict) -> tuple[str,str]:
-    d=event['details'];p=d.get('position') or {}
-    side=p.get('side','')
-    strike=p.get('strike','')
-    kind=event['kind']
-    remaining = 0 if kind in ('EXIT', 'T2') else p.get('remaining_pct')
-    extra= d.get('reason','')
-    subject=f'NIFTY scanner | {kind} {strike} {side} | {extra}'
-    lines=[f'ALERT: {kind}','',f'Event ID: {event["id"]}',
-           f'Position ID: {d.get("position_id")}',f'Observed at: {d.get("observed_at")}',
-           f'Strike: {strike} {side}',f'Expiry: {p.get("expiry")}',
-           f'Entry underlying reference: {p.get("entry_spot")}',
-           f'Underlying initial stop: {p.get("initial_stop")}',
-           f'Current underlying stop: {p.get("stop")}',
-           f'T1 (underlying): {p.get("t1")}',f'T2 (underlying): {p.get("t2")}',
-           f'Position allocated to T1: {p.get("t1_exit_pct") or 50}%',
-           f'Position remaining: {remaining}%',
-           f'Observed underlying reference: {d.get("underlying_reference")}',
-           f'Event reason: {extra}',f'Old/new stop: {d.get("old_stop")} -> {d.get("new_stop")}',
-           f'Old/new T2: {d.get("old_t2")} -> {d.get("new_t2")}',
-           f'Source: {d.get("source")}',
-           f'Effective session cutoff: {d.get("effective_at")}', 
-           f'Signal: {json.dumps(d.get("signal",{}),sort_keys=True)}',
-           f'Execution/risk plan: {json.dumps(d.get("plan",{}),sort_keys=True)}',
-           f'OI context: {json.dumps(d.get("oi",{}),sort_keys=True)}']
-    if evidence := d.get('entry_evidence'):
-        lines.extend([f'Closed candles through: {evidence["candle_through"]}',
-                      f'Index quote at: {evidence["index_quote_at"]}',
-                      f'Candle publication lag: {evidence["candle_lag_minutes"]} min'])
-    lines.extend(['', 'REFERENCE ALERT ONLY. No broker order was placed or confirmed.',
-           'Stops and targets are underlying index reference levels, not option premium stop orders.',
-           'Candle OHLC cannot prove intrabar order or the price at which a user could have filled.',
-           'Uncertain delivery needs explicit mailbox verification before a manual retry.'])
-    return subject,'\n'.join(lines)
+def email_price(value: Any, pattern: str) -> str:
+    try:
+        number = read_number(value, 'email price', positive=True)
+    except (DataError, OverflowError):
+        return 'Unavailable'
+    return format(number, pattern).rstrip('0').rstrip('.')
+
+
+def mail_content(event: dict) -> tuple[str, str]:
+    details = event.get('details') or {}
+    position = details.get('position') or {}
+    observation = event.get('email_observation') or {}
+    kind = event['kind']
+    reason = details.get('reason')
+
+    event_time = None
+    for value in (details.get('effective_at'), details.get('observed_at'), event.get('created_at')):
+        try:
+            event_time = timestamp(value)
+            break
+        except DataError:
+            continue
+    short_time = event_time.strftime('%I:%M %p').lstrip('0') if event_time else 'Unavailable'
+    full_time = 'Unavailable'
+    if event_time:
+        date_text = event_time.strftime('%d %b %Y')
+        clock_text = event_time.strftime('%I:%M:%S %p').lstrip('0')
+        full_time = f'{date_text}, {clock_text} IST'
+
+    side = position.get('side')
+    strike = email_price(position.get('strike'), '.2f')
+    contract = f'{strike} {side}' if side in ('CE', 'PE') else strike
+    premium = email_price(position.get('entry_ask'), '.2f')
+    subject = f'{contract} @ {premium} - Time: {short_time}'
+
+    spot = observation.get('spot')
+    if kind == 'ENTRY':
+        spot = position.get('entry_spot')
+    elif not observation and (
+        (kind in ('EXIT', 'T2') and details.get('source') == 'FRESH_INDEX_QUOTE')
+        or (kind == 'EXIT' and reason == 'CONFIRMED_ZONE_REVERSAL')
+    ):
+        spot = details.get('underlying_reference')
+    spot_text = email_price(spot, ',.4f')
+    if observation.get('spot_is_close'):
+        spot_text += ' (1-minute candle close)'
+
+    if kind == 'EXIT':
+        status = {
+            'STRUCTURAL_SL': 'SL Hit',
+            'SESSION_REFERENCE_EXIT': 'Session exit',
+            'PRIOR_SESSION_REFERENCE_EXPIRED': 'Session exit',
+            'CONFIRMED_ZONE_REVERSAL': 'Reversal exit',
+        }.get(reason, 'Exited')
+    elif kind == 'ADJUST_SL':
+        status = 'T2 updated' if reason == 'T2_REFINED_AFTER_T1' else 'SL adjusted'
+    else:
+        status = {'ENTRY': 'Selected', 'T1': 'T1 reached', 'T2': 'T2 reached'}[kind]
+
+    t1 = email_price(position.get('t1'), ',.4f')
+    t2 = email_price(observation.get('t2', position.get('t2')), ',.4f')
+    stop = email_price(observation.get('stop', position.get('stop')), ',.4f')
+    body = '\n'.join((
+        f'NIFTY Spot: {spot_text}',
+        f'Strike: {contract}',
+        f'Option price at selection: {premium}',
+        f'T1 (underlying): {t1}',
+        f'T2 (underlying): {t2}',
+        f'SL (underlying): {stop}',
+        f'Status: {status}',
+        f'Timestamp: {full_time}',
+    ))
+    return subject, body
 
 
 def arm_delivery(state:dict,token:str,now:datetime) -> int:
@@ -2528,7 +2579,8 @@ def recorded_scan(state:dict,provider, cfg:Config, audit_dir:Path,token:str, rep
         raw={'version':VERSION,'scan_started_at':now.isoformat(),'clock_samples':observations,
              'calls':actor.calls,'config':asdict(cfg),'before_state_sha256':before_hash,
              'before_state':json.loads(before), 'after_scan_state_sha256':scan_state_hash,
-             'result':result,'source_file_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+             'result':result,'email_observations':True,
+             'source_file_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         if cfg.record_inputs and not (
             result.get('reason') in ('AFTER_SESSION_EXIT_CUTOFF', 'NO_VERIFIED_NFO_SESSION',
                                      'BEFORE_FIRST_OI_BASELINE')
@@ -2585,6 +2637,10 @@ def replay_recordings(directory:Path, cfg:Config, output:Path) -> int:
                 raise ScannerError('Captured clock samples were not all consumed')
             if api.index!=len(api.calls):
                 raise ScannerError('Captured calls not all consumed; replay not equivalent')
+            if not r.get('email_observations'):
+                # Older v128 captures predate the optional email-only facts.
+                for event in s['outbox']:
+                    event.pop('email_observation', None)
             new_hash=hashlib.sha256(json.dumps(s,sort_keys=True,allow_nan=False,
                                             separators=(',',':')).encode()).hexdigest()
             matching=(jsonable(evaluated)==r.get('result') and new_hash==r.get('after_scan_state_sha256'))
