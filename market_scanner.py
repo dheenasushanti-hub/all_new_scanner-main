@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v129.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v130.0.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -39,8 +39,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '129.0.0'
-AUDIT_RELEASE = 'v129'
+VERSION = '130.0.0'
+AUDIT_RELEASE = 'v130'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1154,59 +1154,119 @@ def next_oi_objective(levels: list[OILevel], side: int, beyond: float,
     return None
 
 
-def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel],
-              spot: float, cfg: Config, stop_reference: float) -> tuple[RiskPlan | None, str]:
+@dataclass(frozen=True)
+class RiskAssessment:
+    plan: RiskPlan | None
+    reason: str
+    evidence: dict
+
+
+def stop_for_setup(signal: Signal, ctx: PriceContext, spot: float, cfg: Config,
+                   stop_reference: float) -> tuple[float, float]:
     side, atr = signal.side, ctx.atr
-    continuation = signal.scenario in CONTINUATION_SCENARIOS
-    # The previous completed 3m close is a stop reference. When it
-    # lies inside the defended structure, protect beyond the structure.
-    protective_level = min((signal.invalidation, stop_reference), key=lambda level: side * level)
-    stop = protective_level - side * stop_buffer(atr, ctx.atr3 if continuation else 0)
-    risk = side * (spot - stop)
-    if risk < cfg.min_stop_atr * atr:
-        stop = spot - side * cfg.min_stop_atr * atr
-        risk = cfg.min_stop_atr * atr
-    if risk > cfg.max_stop_atr * atr:
-        return None, 'STRUCTURAL_STOP_TOO_WIDE'
-    opposing = ctx.resistances if side == 1 else ctx.supports
-    projected = []
-    for zone in opposing:
-        if zone.strength >= 3 and side * (zone.price - spot) > .15 * atr:
-            matches = [x for x in levels if abs(x.strike - zone.price) <= max(4.0, .60*atr)
-                       and side * (x.strike - spot) > .15*atr]
-            effective = min([zone.price, *(x.strike for x in matches)], key=lambda x: side*x)
-            projected.append((effective, zone.source + ('+OI' if matches else '')))
-    if ctx.range_bounds:
-        edge = ctx.range_bounds[1] if side == 1 else ctx.range_bounds[0]
-        if side * (edge - spot) > .15 * atr:
-            projected.append((edge, '10M_RANGE_EDGE'))
-    if not projected:
-        return None, 'NO_10M_TARGET'
-    level, source = min(projected, key=lambda row: side*row[0])
-    # A strengthening OI barrier confirmed at a price reaction can cap T1.
-    for wall in levels:
-        if not .15 * atr < side * (wall.strike - spot) < side * (level - spot):
+    atr3 = ctx.atr3 if signal.scenario in CONTINUATION_SCENARIOS else 0
+    # Work in the signed direction, then round outward so rounding never
+    # cuts into the structural buffer. Use smaller steps in quieter markets.
+    buffered = min(side * signal.invalidation, side * stop_reference) - stop_buffer(atr, atr3)
+    signed_stop = min(buffered, side * spot - cfg.min_stop_atr * atr)
+    step = 10 if atr >= 10 else 5 if atr >= 5 else 1
+    rounded = math.floor(signed_stop / step) * step
+    # A cosmetic round-out cannot disqualify a structurally valid stop.
+    stop = side * (rounded if side * spot - rounded <= cfg.max_stop_atr * atr else signed_stop)
+    return stop, side * (spot - stop)
+
+
+def defended_walls(levels: list[OILevel], pairs: dict[float, OIPair], bars: list[Candle],
+                   spot: float, side: int, atr: float) -> list[float]:
+    hostile = 'BEARISH' if side == 1 else 'BULLISH'
+    walls = []
+    for row in levels:
+        if side * (row.strike - spot) <= 0:
             continue
-        if wall.change is not None and wall.change > OI_LEVEL_MATERIAL_CHANGE and any(
-            abs(wall.strike - z.price) <= .5 * atr for z in opposing if z.strength >= 2
+        pair = pairs.get(row.strike)
+        # Fresh opposing OI plus a recent price rejection can limit a target.
+        # Gross open interest alone only says where to watch the reaction.
+        if pair is not None and pair.state == hostile and reaction(bars, -side, row.strike, atr, lookback=6):
+            walls.append(row.strike)
+    return walls
+
+
+def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel], spot: float,
+              cfg: Config, stop_reference: float, *, pairs: dict[float, OIPair],
+              bars: list[Candle]) -> RiskAssessment:
+    side, atr = signal.side, ctx.atr
+    stop, risk = stop_for_setup(signal, ctx, spot, cfg, stop_reference)
+    evidence = {'structural_invalidation': signal.invalidation, 'previous_3m_close': stop_reference,
+                'planned_stop': stop, 'risk_points': round(risk, 4),
+                'minimum_reward_risk': cfg.min_reward_risk}
+    if stop <= 0 or not 0 < risk <= cfg.max_stop_atr * atr:
+        return RiskAssessment(None, 'STRUCTURAL_STOP_TOO_WIDE_OR_INVALID', evidence)
+
+    opposing = ctx.resistances if side == 1 else ctx.supports
+    checkpoint_levels = {zone.price for zone in opposing
+                         if zone.strength >= 3 and side * (zone.price - spot) > 0}
+    barriers = defended_walls(levels, pairs, bars, spot, side, atr)
+    if signal.scenario == 'RANGE_EDGE' and ctx.range_bounds:
+        edge = ctx.range_bounds[1] if side == 1 else ctx.range_bounds[0]
+        if side * (edge - spot) > 0:
+            barriers.append(edge)
+            checkpoint_levels.add(edge)
+    checkpoints = sorted(checkpoint_levels, key=lambda level: side * level)
+    barrier = min(barriers, key=lambda level: side * level, default=None)
+    required = spot + side * cfg.min_reward_risk * risk
+    evidence.update(minimum_target=round(required, 4), structural_checkpoints=checkpoints,
+                    opposing_barrier=barrier)
+
+    # Prefer the nearest meaningful OI objective that can pay for the stop.
+    # Completed 10m levels are checkpoints or fallback objectives, and actual
+    # opposing price and OI can cap the route. A range edge is also a cap.
+    ranked = [(row.strike, 'OI_OBJECTIVE') for row in levels]
+    ranked.extend((level, '10M_STRUCTURE') for level in checkpoints)
+    checked = []
+    evidence['target_checks'] = checked
+    target = None
+    found_t1_without_t2 = False
+    for level, source in ranked:
+        if side * (level - spot) <= 0:
+            continue
+        if source == 'OI_OBJECTIVE' and any(
+            abs(level - checkpoint) <= LEVEL_STRIKE_TOLERANCE for checkpoint in checkpoints
         ):
-            level, source = wall.strike, 'DEFENDED_OI_LEVEL_BEFORE_10M_TARGET'
+            source = 'OI_OBJECTIVE_NEAR_10M_STRUCTURE'
+        if source == '10M_STRUCTURE':
+            level -= side * max(.5, .14 * atr)
+        reward_risk = side * (level - spot) / risk
+        if barrier is not None and side * (level - barrier) > 0:
+            reason = 'BEYOND_DEFENDED_BARRIER'
+        elif reward_risk < cfg.min_reward_risk:
+            reason = 'BELOW_MINIMUM_REWARD'
+        else:
+            t2 = next_oi_objective(levels, side, level, atr, separation=max(.8 * atr, .45 * risk))
+            reason = 'QUALIFIED' if t2 is not None else 'NO_FURTHER_OI_TARGET'
+            if t2 is None:
+                found_t1_without_t2 = True
+        checked.append({'level': round(level, 4), 'source': source,
+                        'reward_risk': round(reward_risk, 4), 'reason': reason})
+        if reason == 'QUALIFIED':
+            target = (level, source, reward_risk, t2)
             break
-    # A 10m swing marks the center of a reaction area. A continuation
-    # target sits at its near edge, allowing for the normal 3m excursion.
-    approach = max(.5, .14 * atr)
-    if signal.scenario == 'FAILED_PULLBACK' and '10M' in source:
-        approach = max(approach, .35 * ctx.atr3)
-    t1 = level - side * approach
-    reward = side * (t1 - spot) / risk
-    if reward < cfg.min_reward_risk:
-        return None, 'INSUFFICIENT_REWARD_TO_10M_TARGET'
-    t2 = next_oi_objective(levels, side, t1, atr, separation=max(.8 * atr, .45 * risk))
-    if t2 is None:
-        return None, 'NO_FURTHER_OI_TARGET'
-    policy = 'CONFIRMED_3M_SWING' if continuation else 'STANDARD_POST_T1'
-    return RiskPlan(round(stop, 4), round(t1, 4), t2, source, 'NEXT_OI_LEVEL',
-                    round(risk, 4), round(reward, 4), policy), 'QUALIFIED'
+
+    if target is None:
+        if found_t1_without_t2:
+            reason = 'NO_FURTHER_OI_TARGET'
+        else:
+            reason = 'DEFENDED_BARRIER_LIMITS_REWARD' if barrier is not None else 'NO_TARGET_MEETS_REWARD_TO_RISK'
+        return RiskAssessment(None, reason, evidence)
+    t1, source, reward, t2 = target
+    policy = 'CONFIRMED_3M_SWING' if signal.scenario in CONTINUATION_SCENARIOS else 'STANDARD_POST_T1'
+    plan = RiskPlan(round(stop, 4), round(t1, 4), t2, source, 'NEXT_OI_LEVEL',
+                    round(risk, 4), round(reward, 4), policy)
+    evidence['intermediate_levels'] = sorted(
+        {level for level in checkpoints + [row.strike for row in levels]
+         if 0 < side * (level - spot) < side * (t1 - spot)},
+        key=lambda level: side * level,
+    )
+    return RiskAssessment(plan, 'QUALIFIED', evidence)
 
 
 def live_contract(row: dict, quote: dict | None, now: datetime, index_time: datetime,
@@ -1982,11 +2042,12 @@ def evaluate_setups(signals: list[Signal], context: PriceContext, bars: list[Can
             detail['reason'] = 'PREVIOUS_3M_CLOSE_UNAVAILABLE'
             continue
         levels = oi_levels(window, reading.spot, signal.side, context.atr)
-        plan, reason = risk_plan(signal, context, levels, reading.spot, cfg, reference.close)
-        detail.update(reason=reason, stop_reference_3m=reference.close)
-        if plan is not None:
-            detail['plan'] = asdict(plan)
-            setups.append(EntrySetup(signal, plan, pair, reference.close))
+        risk = risk_plan(signal, context, levels, reading.spot, cfg, reference.close,
+                         pairs=reading.pairs, bars=recent)
+        detail.update(reason=risk.reason, stop_reference_3m=reference.close, risk_evidence=risk.evidence)
+        if risk.plan is not None:
+            detail['plan'] = asdict(risk.plan)
+            setups.append(EntrySetup(signal, risk.plan, pair, reference.close))
     return decisions, setups, confirmed
 
 
@@ -2181,6 +2242,9 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         ('REVERSAL_STRUCTURE', context.recovery_level),
         ('POSITION_ENTRY_LEVEL', active.get('setup_level') if active else None),
     )
+    if active:
+        tracked_levels += tuple(('POSITION_TARGET_CHECKPOINT', level)
+                                for level in active.get('target_checkpoints', ()))
     for source, level in tracked_levels:
         if level is not None and all(watch['level'] != level for watch in watches):
             watches.append({'level': level, 'source': source})
@@ -2276,13 +2340,17 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     if final_reading.band is None or final_reading.band.atm != reading.band.atm:
         return no_trade('ATM_CHANGED_BEFORE_EXECUTION')
     spot, quote_time = final_spot, final_quote_time
-    final_reason = price_confirmation(signal, context, contiguous_tail(bars), spot, cfg)
-    if final_reason is not None:
-        return no_trade(final_reason)
-    plan, final_reason = risk_plan(signal, context, oi_levels(window, spot, signal.side, context.atr),
-                                   spot, cfg, setup.stop_reference)
-    if plan is None:
-        return no_trade(final_reason)
+    final_checks, executable, _ = evaluate_setups(
+        [item.signal for item in setups], context, bars, session_open, final_reading,
+        window, entry_slot, consumed, cfg)
+    if not executable:
+        result['final_risk_checks'] = final_checks
+        return no_trade(final_checks[0]['reason'])
+    setup = executable[0]
+    signal, plan = setup.signal, setup.plan
+    final_evidence = next(check['risk_evidence'] for check in final_checks
+                          if check['identity'] == signal.identity and check['reason'] == 'QUALIFIED')
+    result['final_risk_evidence'] = final_evidence
     result['entry_evidence'].update(index_quote_at=quote_time.isoformat(), index_quote=spot)
 
     ranked = []
@@ -2299,6 +2367,8 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         ranked.append((score is None, -(score or 0), contract['spread_pct'], -contract['depth_lots'],
                        abs(offset), key, contract))
     if not ranked:
+        if not any(row['instrument_key'] in option_quotes for _, _, row in choices):
+            return no_trade('DIRECTIONAL_OPTION_QUOTES_UNAVAILABLE')
         return no_trade('NO_LIQUID_CONTRACT_IN_DIRECTIONAL_OFFSETS')
 
     *_, key, contract = min(ranked, key=lambda item: item[:-1])
@@ -2308,6 +2378,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
                 'instrument_key': key, 'opened_at': now.isoformat(), 'entry_spot': spot,
                 'entry_ask': contract['ask'], 'initial_stop': plan.stop,
                 'setup_level': signal.level, 'setup_invalidation': signal.invalidation,
+                'target_checkpoints': final_evidence['intermediate_levels'],
                 'last_candle': bars[-1].start.isoformat(), 'scenario': signal.scenario,
                 't1_hit': False, 'remaining_pct': 100, 'contract': contract, **asdict(plan)}
     state['position'] = position
@@ -2315,7 +2386,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     engine['consumed_signals'] = (consumed + [item.signal.identity for item in setups])[-160:]
     event_id = new_event(state, 'ENTRY', position_event_payload(
         position, now, reason='QUALIFIED_PRICE_AND_3M_OI', signal=price_public(signal),
-        plan=asdict(plan), entry_evidence=result['entry_evidence'],
+        plan=asdict(plan), entry_evidence=result['entry_evidence'], risk_evidence=final_evidence,
         oi={'window': result['oi'], 'confirmation_pair': setup.oi_pair.public(),
             'stop_reference_3m': setup.stop_reference, 'contract': contract}), now)
     result['alerts_created'].append(event_id)
