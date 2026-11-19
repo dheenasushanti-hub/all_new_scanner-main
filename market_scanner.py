@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v130.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v130.1.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -39,8 +39,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '130.0.0'
-AUDIT_RELEASE = 'v130'
+VERSION = '130.1.0'
+AUDIT_RELEASE = 'v130_1'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1714,7 +1714,8 @@ def close_reference(position: dict, at: datetime, reason: str, observed: float |
 
 def manage_reference(p: dict, bars: list[Candle], spot: float | None,
                      now: datetime, deadline: datetime,
-                     cfg: Config) -> tuple[dict | None, list[tuple[str, dict]], dict | None, list[str]]:
+                     cfg: Config, *,
+                     spot_at: datetime | None = None) -> tuple[dict | None, list[tuple[str, dict]], dict | None, list[str]]:
     position = copy.deepcopy(p)
     side = 1 if position['direction'] == 'BULLISH' else -1
     cursor = timestamp(position['last_candle'])
@@ -1733,9 +1734,16 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         return None, alerts, close_reference(position, at, reason, value, source), warnings
 
     def hit_t1(at, source, email_observation):
+        old_stop = position['stop']
+        entry = position['entry_spot']
+        if side * (entry - old_stop) > 0:
+            position.update(stop=entry, adjusted_at=at.isoformat(),
+                            stop_before_adjustment=old_stop,
+                            t2_before_adjustment=position['t2'])
         position.update(t1_hit=True, t1_at=at.isoformat(), remaining_pct=100-position.get('t1_exit_pct', 50))
         emit('T1', at, source=source, underlying_reference=position['t1'],
-             email_observation=email_observation)
+             old_stop=old_stop, new_stop=position['stop'],
+             email_observation={**email_observation, 'stop': position['stop']})
 
     entry_minute = exact_minute(opening)
     expected = max(cursor, entry_minute) + MINUTE
@@ -1758,10 +1766,17 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         if side * (adverse - stop) <= 0:
             return finish('EXIT', at, 'STRUCTURAL_SL', stop, 'COMPLETED_1M_STOP_FIRST',
                           candle_observation)
-        if not position['t1_hit'] and side * (favorable - position['t1']) >= 0:
+        reached_t1 = not position['t1_hit'] and side * (favorable - position['t1']) >= 0
+        if reached_t1:
             hit_t1(at, 'COMPLETED_1M_HIGH_LOW', candle_observation)
+            candle_observation['stop'] = position['stop']
         if position['t1_hit'] and side * (favorable - t2) >= 0:
             return finish('T2', at, 'OI_TARGET_REACHED', t2, 'COMPLETED_1M_HIGH_LOW',
+                          candle_observation)
+        # The new stop is active at the completed candle's timestamp. Its
+        # close can trigger the stop at once, while its earlier wick cannot.
+        if reached_t1 and side * (bar.close - position['stop']) <= 0:
+            return finish('EXIT', at, 'STRUCTURAL_SL', bar.close, 'COMPLETED_1M_CLOSE_AFTER_T1',
                           candle_observation)
         position['last_candle'] = bar.start.isoformat()
         expected += MINUTE
@@ -1769,7 +1784,8 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
     if now >= deadline:
         return finish('EXIT', now, 'SESSION_REFERENCE_EXIT', spot,
                       'FRESH_INDEX_QUOTE' if spot is not None else 'CLOCK_NO_FRESH_INDEX_QUOTE')
-    if spot is not None:
+    stop_changed_at = position.get('adjusted_at')
+    if spot is not None and (stop_changed_at is None or (spot_at or now) >= timestamp(stop_changed_at)):
         if side * (spot - position['stop']) <= 0:
             return finish('EXIT', now, 'STRUCTURAL_SL', spot, 'FRESH_INDEX_QUOTE')
         if not position['t1_hit'] and side * (spot - position['t1']) >= 0:
@@ -2214,8 +2230,11 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
 
     if active is not None:
         observed = index_spot if quote_time is not None and quote_time >= timestamp(active['opened_at']) else None
-        managed, events, closed, warnings = manage_reference(active, bars, observed, now, deadline, cfg)
-        if (managed is not None and managed['t1_hit'] and observed is not None
+        managed, events, closed, warnings = manage_reference(
+            active, bars, observed, now, deadline, cfg, spot_at=quote_time)
+        # The T1 alert already contains the initial adjustment. Further
+        # trailing and target refinement can resume on a subsequent scan.
+        if (managed is not None and active.get('t1_hit', False) and observed is not None
                 and price.covers_entry(price_slot(now)) and now < deadline):
             events.extend(refine_reference(managed, bars, observed, window, now,
                                             session_open=session_open))
@@ -2428,8 +2447,6 @@ def mail_content(event: dict) -> tuple[str, str]:
     strike = email_price(position.get('strike'), '.2f')
     contract = f'{strike} {side}' if side in ('CE', 'PE') else strike
     premium = email_price(position.get('entry_ask'), '.2f')
-    subject = f'{contract} @ {premium} - Time: {short_time}'
-
     spot = observation.get('spot')
     if kind == 'ENTRY':
         spot = position.get('entry_spot')
@@ -2443,31 +2460,46 @@ def mail_content(event: dict) -> tuple[str, str]:
         spot_text += ' (1-minute candle close)'
 
     if kind == 'EXIT':
-        status = {
-            'STRUCTURAL_SL': 'SL Hit',
-            'SESSION_REFERENCE_EXIT': 'Session exit',
-            'PRIOR_SESSION_REFERENCE_EXPIRED': 'Session exit',
-            'CONFIRMED_ZONE_REVERSAL': 'Reversal exit',
-        }.get(reason, 'Exited')
+        subject_label, status = {
+            'STRUCTURAL_SL': ('SL HIT', 'SL Hit'),
+            'SESSION_REFERENCE_EXIT': ('Session exit', 'Session exit'),
+            'PRIOR_SESSION_REFERENCE_EXPIRED': ('Session exit', 'Session exit'),
+            'CONFIRMED_ZONE_REVERSAL': ('Reversal exit', 'Reversal exit'),
+        }.get(reason, ('Exit', 'Exited'))
     elif kind == 'ADJUST_SL':
         status = 'T2 updated' if reason == 'T2_REFINED_AFTER_T1' else 'SL adjusted'
+        subject_label = status
     else:
-        status = {'ENTRY': 'Selected', 'T1': 'T1 reached', 'T2': 'T2 reached'}[kind]
+        subject_label, status = {
+            'ENTRY': ('Entry', 'Selected'),
+            'T1': ('Target - T1', 'T1 reached'),
+            'T2': ('Target T2', 'T2 reached'),
+        }[kind]
+    subject = f'{subject_label} | {contract} @ {premium} - Time: {short_time}'
 
     t1 = email_price(position.get('t1'), ',.4f')
     t2 = email_price(observation.get('t2', position.get('t2')), ',.4f')
     stop = email_price(observation.get('stop', position.get('stop')), ',.4f')
-    body = '\n'.join((
+    fields = [
         f'NIFTY Spot: {spot_text}',
         f'Strike: {contract}',
         f'Option price at selection: {premium}',
         f'T1 (underlying): {t1}',
         f'T2 (underlying): {t2}',
         f'SL (underlying): {stop}',
+    ]
+    if kind == 'T1' and details.get('old_stop') is not None and details.get('new_stop') is not None:
+        previous = email_price(details['old_stop'], ',.4f')
+        updated = email_price(details['new_stop'], ',.4f')
+        if details['old_stop'] == details['new_stop']:
+            fields.append(f'SL retained for remaining position: {updated}')
+        else:
+            fields.append(f'SL adjustment for remaining position: {previous} -> {updated}')
+    fields.extend((
         f'Status: {status}',
         f'Timestamp: {full_time}',
     ))
-    return subject, body
+    return subject, '\n'.join(fields)
 
 
 def arm_delivery(state:dict,token:str,now:datetime) -> int:
