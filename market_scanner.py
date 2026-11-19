@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v128.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v129.0.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -7,7 +7,7 @@ durable outbox retains position and delivery identity across workflow reruns.
 
 The supplied OHLC workbooks support historical price validation. They contain
 no option OI snapshots or quotes. Exact historical strike decisions need
-timestamped option captures. The 1.80%–2.00% entry band is a strategy rule.
+timestamped option captures. Directional OI confirmation uses signed Call and Put changes at the same strike.
 
 Price analysis uses available closed one-minute candles. A one-minute
 publication lag can qualify for entry only with a recent trigger, a matched
@@ -39,8 +39,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '128.0.0'
-AUDIT_RELEASE = 'v128'
+VERSION = '129.0.0'
+AUDIT_RELEASE = 'v129'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -153,16 +153,20 @@ def parse_candles(raw: list, now: datetime) -> list[Candle]:
 
 
 def contiguous_tail(bars: list[Candle]) -> list[Candle]:
+    if not bars:
+        return []
     start = len(bars)-1
     while start and bars[start].start-bars[start-1].start == timedelta(minutes=1):
         start -= 1
-    return bars[start:] if bars else []
+    return bars[start:]
 
 
 def volatility(bars: list[Candle], n=14, minimum=3.0) -> float:
     window=bars[-(n+1):]
-    if len(window)<3:
+    if not window:
         return minimum
+    if len(window) == 1:
+        return max(minimum, window[0].high - window[0].low)
     tr = [max(b.high-b.low, abs(b.high-a.close), abs(b.low-a.close)) for a,b in zip(window,window[1:])]
     return max(minimum, sum(tr)/len(tr))
 
@@ -171,8 +175,6 @@ def volatility(bars: list[Candle], n=14, minimum=3.0) -> float:
 
 @dataclass(frozen=True)
 class Config:
-    oi_entry_floor_bps: int = 180
-    oi_entry_ceiling_bps: int = 200
     oi_jitter_seconds: int = 35
     feed_grace_seconds: float = 2.0
     quote_max_age_seconds: int = 35
@@ -194,7 +196,7 @@ class Config:
                     raise DataError('record_inputs must be a boolean')
             elif type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise DataError('Invalid configuration: ' + key)
-        for name in ('oi_entry_floor_bps', 'oi_entry_ceiling_bps', 'oi_jitter_seconds',
+        for name in ('oi_jitter_seconds',
                      'quote_max_age_seconds', 'quote_max_skew_seconds',
                      'cooldown_minutes', 'max_state_history'):
             if type(getattr(self, name)) is not int:
@@ -203,14 +205,14 @@ class Config:
                 and self.min_stop_atr < self.max_stop_atr and self.min_reward_risk >= 1
                 and self.quote_max_skew_seconds <= self.quote_max_age_seconds):
             raise DataError('Inconsistent configuration')
-        if not 180 <= self.oi_entry_floor_bps <= self.oi_entry_ceiling_bps <= 200:
-            raise DataError('OI entry bounds must be ordered within 180–200 basis points')
 
 
 MINUTE = timedelta(minutes=1)
 OI_MINUTES = 3
 MAX_ENTRY_CANDLE_LAG = MINUTE
-MAX_TRIGGER_AGE = 2 * MINUTE
+DISPATCH_INTERVAL = 3 * MINUTE
+MAX_TRIGGER_AGE = DISPATCH_INTERVAL + MAX_ENTRY_CANDLE_LAG
+LEVEL_STRIKE_TOLERANCE = 20.0
 CANDLE_REFRESH_REQUEST_BUDGET = timedelta(seconds=16)
 # Separate from strike eligibility. Used when judging changes in the OI map.
 OI_LEVEL_MATERIAL_CHANGE = .02
@@ -439,14 +441,6 @@ def pressure(bars: list[Candle], side: int, atr: float) -> bool:
             and steps[-1] >= -.30 * atr)
 
 
-def reversal_pressure(bars: list[Candle], side: int, atr: float) -> bool:
-    steps = directional_steps(bars, side)
-    if not steps:
-        return False
-    return (sum(step > 0 for step in steps) >= 2 and steps[-1] > 0
-            and sum(steps) >= max(.50 * atr, .65 * sum(abs(step) for step in steps)))
-
-
 def failed_pullback(bars: list[Candle], threes: list[Candle], side: int, atr: float) -> Signal | None:
     """Find the first close through a failed pullback in an established trend.
 
@@ -560,15 +554,6 @@ class PendingReversal:
     intervening_extreme: float
 
 
-@dataclass
-class PriceSweep:
-    testing: Candle
-    side: int
-    level: float
-    recovery: float | None = None
-    last_retest: float | None = None
-
-
 def edge_price(bar: Candle, side: int) -> float:
     return bar.low if side == 1 else bar.high
 
@@ -582,7 +567,6 @@ class SessionReversals:
 
     def __init__(self):
         self.zones: dict[int, list[SessionZone]] = {1: [], -1: []}
-        self.sweeps: dict[int, PriceSweep] = {}
         self.pending: list[PendingReversal] = []
         self.last: datetime | None = None
 
@@ -591,7 +575,7 @@ class SessionReversals:
         if self.last is not None and current.start != self.last + MINUTE:
             raise DataError('Reversal ledger requires contiguous minute candles')
         self.last = current.start
-        if len(bars) < 4:
+        if len(bars) < 3:
             return []
 
         for side in (1, -1):
@@ -607,10 +591,9 @@ class SessionReversals:
         waiting, signals = [], []
         for setup in self.pending:
             side = setup.side
-            if (now - setup.second.confirmed > 7 * MINUTE
-                    or side * (edge_price(current, side) - setup.invalidation) < -.18 * atr):
+            if side * (edge_price(current, side) - setup.invalidation) < -.18 * atr:
                 continue
-            if side * (current.close - setup.trigger) < 0:
+            if side * (current.close - setup.trigger) <= 0:
                 waiting.append(setup)
                 continue
             if side * (current.close - bars[-2].close) <= 0:
@@ -624,10 +607,6 @@ class SessionReversals:
                                  setup.intervening_extreme),
             ))
         self.pending = waiting
-        for side in (1, -1):
-            recovery = self._advance_sweep(bars, side, atr)
-            if recovery is not None:
-                signals.append(recovery)
         return signals
 
     def _observe_test(self, bars: list[Candle], side: int, atr: float) -> None:
@@ -640,9 +619,11 @@ class SessionReversals:
         if side * (confirm.close - test_edge) < .42 * atr:
             return
         test = PriceTest(side, tested.start, bar_end(confirm), test_edge, atr)
+        visit_tolerance = min(LEVEL_STRIKE_TOLERANCE, max(2., 1.02 * atr))
         matches = sorted(
             (z for z in self.zones[side] if z.invalidated_at is None
-             and abs(z.anchor - test_edge) <= min(z.width, max(2., 1.02 * atr))),
+             and abs(z.anchor - test_edge) <= LEVEL_STRIKE_TOLERANCE
+             and any(abs(prior.extreme - test_edge) <= visit_tolerance for prior in z.tests)),
             key=lambda z: (abs(z.anchor - test_edge), z.tests[0].start),
         )
         if not matches:
@@ -652,7 +633,8 @@ class SessionReversals:
         independent = []
         for zone in matches:
             for prior in reversed(zone.tests):
-                if tested.start - prior.start < 2 * MINUTE:
+                if (abs(prior.extreme - test_edge) > visit_tolerance
+                        or tested.start - prior.start < 2 * MINUTE):
                     continue
                 between = [b for b in bars if prior.start < b.start < tested.start]
                 if not between:
@@ -661,72 +643,43 @@ class SessionReversals:
                 departure = inside_move - max(side * prior.extreme, side * test_edge)
                 closed_reaction = max(side * (b.close - prior.extreme) for b in between)
                 if departure >= .53 * atr and closed_reaction >= .30 * atr:
-                    score = departure - .15 * abs(prior.extreme - test_edge)
-                    independent.append((score, prior, zone, inside_move))
+                    independent.append((prior, zone, inside_move))
         if not independent:
             return
-        _, prior, zone, inside_move = max(independent, key=lambda row: (row[0], row[1].start))
-        separation = tested.start - prior.start
-        # Keep the established zone fixed. A later test cannot drag it from
-        # one swing to the next. The recent test owns risk once a new leg starts.
+        prior, zone, inside_move = max(independent, key=lambda row: (
+            row[0].start, -abs(row[1].anchor - test_edge)))
+        # The highest rebound (or lowest pullback) belongs to this pair
+        # of distinct visits, irrespective of the elapsed number of minutes.
         zone.tests.append(test)
-        if separation <= 8 * MINUTE:
-            neck = inside_move
-            stop = side * min(side * prior.extreme, side * test_edge)
-        else:
-            neck = max(side * away_price(pre, side), side * away_price(tested, side))
-            stop = test_edge
-        trigger = side * (neck + max(.6, .11 * atr))
+        stop = side * min(side * prior.extreme, side * test_edge)
+        trigger = side * inside_move
         self.pending = [x for x in self.pending
                         if not (x.side == side and abs(x.level - zone.anchor) <= zone.width)]
         self.pending.append(PendingReversal(side, prior, test, trigger, stop, zone.anchor,
                                             side * inside_move))
 
-    def _advance_sweep(self, bars: list[Candle], side: int, atr: float) -> Signal | None:
-        current = bars[-1]
-        now = bar_end(current)
-        high_score = side * away_price(current, side)
-        test_score = side * edge_price(current, side)
-        old = self.sweeps.get(side)
-        if old is not None:
-            origin = side * edge_price(old.testing, side)
-            if current.start - old.testing.start > 10 * MINUTE or test_score <= origin:
-                self.sweeps.pop(side)
-                old = None
-            elif old.recovery is None:
-                if side * (current.close - old.level) >= .85 * atr:
-                    old.recovery = high_score
-            else:
-                retest_close = side * (current.close - current.open)
-                retrace = old.recovery - test_score
-                if (retrace >= .40 * atr and test_score - origin >= .40 * atr
-                        and side * (current.close - old.level) >= .50 * atr
-                        and retest_close >= .22 * atr
-                        and (old.last_retest is None or side * old.last_retest - test_score >= .15 * atr)
-                        and side * (current.close - bars[-2].close) > 0):
-                    old.last_retest = edge_price(current, side)
-                    return Signal(
-                        side, 'SWEEP_RETEST', now, current.start, current.close,
-                        edge_price(current, side), old.level,
-                        ReversalEvidence(old.testing.start, current.start,
-                                         edge_price(old.testing, side), edge_price(current, side),
-                                         now, 'RECLAIM_AND_DEFENDED_RETEST'),
-                    )
-                old.recovery = max(old.recovery, high_score)
-        if old is None:
-            reference = side * min(side * edge_price(b, side) for b in bars[-4:-1])
-            if (side * (reference - edge_price(current, side)) >= .30 * atr
-                    and side * (current.close - reference) >= .24 * atr):
-                self.sweeps[side] = PriceSweep(current, side, reference)
-        return None
+    def watches(self, spot: float, radius: float) -> list[dict]:
+        watches = []
+        for zones in self.zones.values():
+            for zone in zones:
+                if zone.invalidated_at is not None or abs(zone.anchor - spot) > radius:
+                    continue
+                watches.append({'side': zone.side, 'level': zone.anchor,
+                                'tests': [price_public(test) for test in zone.tests[-2:]]})
+        for setup in self.pending:
+            if abs(setup.level - spot) <= radius:
+                watches.append({'side': setup.side, 'level': setup.level,
+                                'first_test': setup.first.start.isoformat(),
+                                'second_test': setup.second.start.isoformat(),
+                                'trigger': setup.trigger})
+        return watches
 
 
-def confirmed_reversal(signal: Signal, bars: list[Candle], atr: float) -> bool:
-    if signal.scenario != 'SWEEP_RETEST':
-        return reversal_pressure(bars, signal.side, atr)
-    steps = directional_steps(bars, signal.side)
-    return bool(steps and steps[-1] > 0 and sum(x > 0 for x in steps) >= 2
-                and sum(steps) >= max(.42 * atr, .48 * sum(abs(x) for x in steps)))
+def confirmed_reversal(signal: Signal, bars: list[Candle]) -> bool:
+    evidence = signal.reversal
+    if evidence is None or evidence.pattern != 'REPEATED_ZONE' or evidence.intervening_extreme is None:
+        return False
+    return signal.side * (bars[-1].close - evidence.intervening_extreme) > 0
 
 
 def reaction(bars: list[Candle], side: int, price: float, atr: float,
@@ -836,12 +789,12 @@ def resolve_market_phase(bars: list[Candle], threes: list[Candle], previous: Pri
         if recovery_side == side or (trend == side and recovery_side != -side):
             continue
         qualified = [signal for signal in signals if signal.reversal is not None and signal.side == side
-                     and confirmed_reversal(signal, bars, atr)]
+                     and confirmed_reversal(signal, bars)]
         if recovery_side == -side and opposing_defense:
             # A durable opposite reversal may replace the old recovery. A
             # compact counter-move while its defended swing is close may not.
-            qualified = [signal for signal in qualified if is_zone_rotation(signal)
-                         and abs(last.close - recovery_level) > .55 * atr]
+            qualified = [signal for signal in qualified
+                         if abs(last.close - recovery_level) > .55 * atr]
         if qualified:
             best = max(qualified, key=lambda signal: (signal.reversal.pattern == 'REPEATED_ZONE',
                                                        signal.at, -side * signal.invalidation))
@@ -1033,39 +986,6 @@ class OIObservation:
     def increase(self) -> float:
         return (self.row.oi - self.prior) / self.prior
 
-    def exceeds(self, threshold_bps: int) -> bool:
-        # Compare raw OI counts so displayed rounding cannot change eligibility.
-        return self.prior > 0 and (self.row.oi - self.prior) * 10_000 > self.prior * threshold_bps
-
-
-@dataclass(frozen=True)
-class OIEntryThreshold:
-    bps: int
-    reason: str
-
-
-def entry_oi_threshold(signal: Signal, context: PriceContext, bars: list[Candle],
-                       spot: float, cfg: Config) -> OIEntryThreshold:
-    """Reduce the hurdle only for fresh signals with clean price follow-through."""
-    floor, ceiling = cfg.oi_entry_floor_bps, cfg.oi_entry_ceiling_bps
-    if floor == ceiling:
-        return OIEntryThreshold(ceiling, 'FIXED_CONFIGURED_THRESHOLD')
-    extension = signal.side * (spot - signal.trigger)
-    opposing_defense = context.defends_resistance if signal.side == 1 else context.defends_support
-    age = context.at - signal.at
-    if opposing_defense or not timedelta(0) <= age <= MINUTE or not 0 <= extension <= .55 * context.atr:
-        return OIEntryThreshold(ceiling, 'STANDARD_PRICE_THRESHOLD')
-    steps = directional_steps(bars, signal.side)
-    if not steps or steps[-1] <= 0 or sum(step > 0 for step in steps) < 2:
-        return OIEntryThreshold(ceiling, 'STANDARD_PRICE_THRESHOLD')
-    net = sum(steps)
-    efficiency = net / sum(abs(step) for step in steps)
-    if net >= .75 * context.atr and efficiency >= .65:
-        return OIEntryThreshold(floor, 'STRONG_EARLY_PRICE_CONFIRMATION')
-    if net >= .50 * context.atr and efficiency >= .50:
-        return OIEntryThreshold((floor + ceiling) // 2, 'EARLY_PRICE_CONFIRMATION')
-    return OIEntryThreshold(ceiling, 'STANDARD_PRICE_THRESHOLD')
-
 
 @dataclass(frozen=True)
 class OIWindow:
@@ -1090,11 +1010,12 @@ def match_oi(saved: list[dict], current: OISnapshot, cfg: Config) -> OIWindow | 
     options = []
     for row in saved:
         previous = OISnapshot.restore(row)
-        if previous.expiry != current.expiry or previous.through != current.through - 3 * MINUTE:
+        if previous.expiry != current.expiry or previous.at.date() != current.at.date():
             continue
         elapsed = (current.at - previous.at).total_seconds()
-        if abs(elapsed - 180) <= cfg.oi_jitter_seconds:
-            options.append((abs(elapsed - 180), previous.at, previous))
+        expected = DISPATCH_INTERVAL.total_seconds()
+        if abs(elapsed - expected) <= cfg.oi_jitter_seconds:
+            options.append((abs(elapsed - expected), previous.at, previous))
     if not options:
         return None
     past = min(options, key=lambda item: (item[0], item[1]))[2]
@@ -1107,49 +1028,82 @@ def match_oi(saved: list[dict], current: OISnapshot, cfg: Config) -> OIWindow | 
     return OIWindow(current, past.at, tuple(changes)) if changes else None
 
 
-@dataclass(frozen=True)
-class OptionCandidate:
-    row: OIRow
-    atm: float
-    offset: int
-    change: float
-    prior_oi: int
-    threshold_bps: int
-
-
 def listed_strikes(contracts: list[dict]) -> list[float]:
-    # Missing OI cannot silently move ATM or the offsets.
-    by_side = [{float(row['strike_price']) for row in contracts if row['instrument_type'] == kind}
-               for kind in ('CE', 'PE')]
-    return sorted(by_side[0] & by_side[1])
+    # A missing leg is evidence about data availability, never a reason to
+    # renumber the exchange's listed strikes or move ATM to another strike.
+    return sorted({float(row['strike_price']) for row in contracts
+                   if row['instrument_type'] in ('CE', 'PE')})
 
 
-def rank_options(window: OIWindow, grid: list[float], side: int,
-                 spot: float, threshold_bps: int) -> tuple[list[OptionCandidate], list[dict]]:
-    kind = 'CE' if side == 1 else 'PE'
-    if len(grid) < 3 or not grid[0] <= spot <= grid[-1]:
-        return [], []
-    idx = min(range(len(grid)), key=lambda i: (abs(grid[i] - spot), grid[i]))
-    selected_indices = (idx-side, idx-2*side)
-    if not all(0 <= i < len(grid) for i in selected_indices):
-        return [], []
-    changes = {(x.row.side, x.row.strike): x for x in window.changes}
-    ranked, audit = [], []
-    for i in selected_indices:
-        strike = grid[i]
-        item = changes.get((kind, strike))
-        audit.append({'side': kind, 'strike': strike, 'offset': i-idx, 'atm': grid[idx],
-                      'status': 'MATCHED' if item else 'OI_COMPARISON_MISSING',
-                      'increase_pct': 100 * item.increase if item else None,
-                      'prior_oi': item.prior if item else None,
-                      'current_oi': item.row.oi if item else None,
-                      'meets_threshold': item.exceeds(threshold_bps) if item else None})
-        if item and item.exceeds(threshold_bps):
-            ranked.append(OptionCandidate(item.row, grid[idx], i-idx, item.increase,
-                                          item.prior, threshold_bps))
-    if any(x['status'] != 'MATCHED' for x in audit):
-        return [], audit
-    return sorted(ranked, key=lambda x: (-x.change, abs(x.offset), x.row.key)), audit
+@dataclass(frozen=True)
+class OIPair:
+    strike: float
+    call: OIObservation | None
+    put: OIObservation | None
+
+    @property
+    def state(self) -> str:
+        if self.call is None or self.put is None:
+            return 'MISSING'
+        call, put = self.call.increase, self.put.increase
+        if max(abs(call), abs(put)) < OI_LEVEL_MATERIAL_CHANGE:
+            return 'QUIET'
+        if call < 0 < put:
+            return 'BULLISH'
+        if put < 0 < call:
+            return 'BEARISH'
+        return 'MIXED'
+
+    def score(self, side: int) -> float | None:
+        if self.call is None or self.put is None:
+            return None
+        return side * (self.put.increase - self.call.increase)
+
+    def public(self) -> dict:
+        return {'strike': self.strike, 'state': self.state,
+                'call_change_pct': 100 * self.call.increase if self.call is not None else None,
+                'put_change_pct': 100 * self.put.increase if self.put is not None else None}
+
+
+@dataclass(frozen=True)
+class StrikeBand:
+    atm: float
+    pairs: dict[int, OIPair]
+
+    @classmethod
+    def build(cls, grid: list[float], spot: float, pairs: dict[float, OIPair]):
+        if not grid or not grid[0] <= spot <= grid[-1]:
+            return None
+        center = min(range(len(grid)), key=lambda i: (abs(grid[i] - spot), grid[i]))
+        observed = {}
+        for offset in (-2, -1, 0, 1, 2):
+            index = center + offset
+            if 0 <= index < len(grid):
+                strike = grid[index]
+                observed[offset] = pairs.get(strike, OIPair(strike, None, None))
+        return cls(grid[center], observed)
+
+    def public(self) -> dict:
+        return {'atm': self.atm, 'strikes': [
+            {'offset': offset, **self.pairs[offset].public()} if offset in self.pairs
+            else {'offset': offset, 'state': 'MISSING_LISTING'}
+            for offset in (-2, -1, 0, 1, 2)
+        ]}
+
+
+def paired_oi(window: OIWindow | None) -> dict[float, OIPair]:
+    if window is None:
+        return {}
+    by_strike: dict[float, dict[str, OIObservation]] = {}
+    for item in window.changes:
+        by_strike.setdefault(item.row.strike, {})[item.row.side] = item
+    return {strike: OIPair(strike, rows.get('CE'), rows.get('PE')) for strike, rows in by_strike.items()}
+
+
+def pairs_at(level: float, grid: list[float], pairs: dict[float, OIPair]) -> list[OIPair]:
+    return [pairs.get(strike, OIPair(strike, None, None))
+            for strike in sorted(grid, key=lambda x: (abs(x - level), x))
+            if abs(strike - level) <= LEVEL_STRIKE_TOLERANCE]
 
 
 @dataclass(frozen=True)
@@ -1173,50 +1127,6 @@ def oi_levels(window: OIWindow, spot: float, side: int, atr: float) -> list[OILe
     return sorted(levels, key=lambda x: x.strike * side)
 
 
-def level_confirmation(signal: Signal, ctx: PriceContext, window: OIWindow,
-                       spot: float) -> tuple[bool, dict]:
-    side = signal.side
-    same = oi_levels(window, spot, -side, ctx.atr)
-    ahead = oi_levels(window, spot, side, ctx.atr)
-    locality = max(25.0, 1.7 * ctx.atr)
-    supportive = [x for x in same if abs(x.strike - signal.level) <= locality]
-    cleared = [x for x in ahead if abs(x.strike - signal.level) <= locality
-               and side * (spot - x.strike) > .10 * ctx.atr]
-    # A move through a former wall or defense can itself verify the price
-    # reaction. Falling OI there strengthens the break. An intact wall remains
-    # a target constraint even when the selected option is building OI.
-    material = OI_LEVEL_MATERIAL_CHANGE
-    weakening = [x for x in cleared if x.change is not None and x.change < -material]
-    held_level = [x for x in supportive if x.change is not None and x.change >= -material]
-    changed_support = [x for x in held_level if x.change is not None and x.change > material]
-    near_wall = [x for x in ahead if 0 <= side * (x.strike - spot) <= .85 * ctx.atr
-                 and x.change is not None and x.change > material]
-    defense = ctx.defends_resistance if side == 1 else ctx.defends_support
-    detail = {'held_levels': [asdict(x) for x in held_level],
-              'strengthening_levels': [asdict(x) for x in changed_support],
-              'cleared_levels': [asdict(x) for x in cleared],
-              'weakening_barriers': [asdict(x) for x in weakening],
-              'intact_nearby_walls': [asdict(x) for x in near_wall]}
-    if signal.scenario == 'FAILED_PULLBACK':
-        # A live OI wall matters here only when price has defended that wall.
-        # An unrelated old support or resistance cannot corroborate it.
-        price_walls = ctx.resistances if side == 1 else ctx.supports
-        nearby_confirmed = any(abs(wall.strike - zone.price) <= max(2., .35 * ctx.atr)
-                               for wall in near_wall for zone in price_walls if zone.strength >= 2)
-        return not (defense and nearby_confirmed), detail
-    if defense and near_wall:
-        return False, detail
-    if signal.scenario in ('PULLBACK_CONTINUATION', 'TREND_RESUMPTION',
-                           'ACCEPTED_BREAKOUT', 'ACCEPTED_BREAKDOWN'):
-        # Require local OI evidence at the defended or broken level. The strike
-        # ranking gate independently applies the selected entry threshold.
-        evidence = changed_support or weakening or [
-            x for x in held_level if x.change > 0
-        ] or [x for x in cleared if x.change is not None and x.change < 0]
-        return bool(evidence), detail
-    return True, detail
-
-
 @dataclass(frozen=True)
 class RiskPlan:
     stop: float
@@ -1229,12 +1139,6 @@ class RiskPlan:
     stop_policy: str
     t1_exit_pct: int = 50
     blended_reward_risk: float | None = None
-
-
-def is_zone_rotation(signal: Signal) -> bool:
-    evidence = signal.reversal
-    return bool(evidence and evidence.pattern == 'REPEATED_ZONE'
-                and evidence.second_test - evidence.first_test >= 9 * MINUTE)
 
 
 def stop_buffer(atr_1m: float, atr_3m: float = 0) -> float:
@@ -1251,10 +1155,13 @@ def next_oi_objective(levels: list[OILevel], side: int, beyond: float,
 
 
 def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel],
-              spot: float, cfg: Config) -> tuple[RiskPlan | None, str]:
+              spot: float, cfg: Config, stop_reference: float) -> tuple[RiskPlan | None, str]:
     side, atr = signal.side, ctx.atr
     continuation = signal.scenario in CONTINUATION_SCENARIOS
-    stop = signal.invalidation - side * stop_buffer(atr, ctx.atr3 if continuation else 0)
+    # The previous completed 3m close is a stop reference. When it
+    # lies inside the defended structure, protect beyond the structure.
+    protective_level = min((signal.invalidation, stop_reference), key=lambda level: side * level)
+    stop = protective_level - side * stop_buffer(atr, ctx.atr3 if continuation else 0)
     risk = side * (spot - stop)
     if risk < cfg.min_stop_atr * atr:
         stop = spot - side * cfg.min_stop_atr * atr
@@ -1276,17 +1183,6 @@ def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel],
     if not projected:
         return None, 'NO_10M_TARGET'
     level, source = min(projected, key=lambda row: side*row[0])
-    if signal.scenario == 'SWEEP_RETEST':
-        # A broken 10m level can become a barrier on the retest. Require
-        # corroboration at that price from a growing OI concentration.
-        structure = [z for z in (*ctx.supports, *ctx.resistances) if z.strength >= 3]
-        capped = [row for row in levels if row.change is not None
-                  and row.change > OI_LEVEL_MATERIAL_CHANGE
-                  and .15 * atr < side * (row.strike - spot) < side * (level - spot)
-                  and any(abs(row.strike - z.price) <= .65 * atr for z in structure)]
-        if capped:
-            level = min(capped, key=lambda row: side * row.strike).strike
-            source = '10M_STRUCTURE_AND_OI_RETEST'
     # A strengthening OI barrier confirmed at a price reaction can cap T1.
     for wall in levels:
         if not .15 * atr < side * (wall.strike - spot) < side * (level - spot):
@@ -1303,22 +1199,6 @@ def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel],
         approach = max(approach, .35 * ctx.atr3)
     t1 = level - side * approach
     reward = side * (t1 - spot) / risk
-    if reward < cfg.min_reward_risk and is_zone_rotation(signal):
-        # A distant repeated zone can justify staged exits. The first support
-        # or resistance remains T1. T2 needs independent confluence with the
-        # intervening swing, and the weighted plan must still meet min R.
-        peak = signal.reversal.intervening_extreme
-        if peak is not None and reward >= .60:
-            choices = [row for row in levels if abs(row.strike - peak) <= max(2., .55 * atr)
-                       and side * (row.strike - t1) > max(.8 * atr, .45 * risk)]
-            if choices:
-                wall = min(choices, key=lambda row: abs(row.strike - peak))
-                t2 = wall.strike - side * max(.5, .10 * atr)
-                blended = .40 * reward + .60 * side * (t2 - spot) / risk
-                if blended >= cfg.min_reward_risk:
-                    return RiskPlan(round(stop, 4), round(t1, 4), round(t2, 4), source,
-                                    'OI_AND_REPEATED_ZONE_EXCURSION', round(risk, 4), round(reward, 4),
-                                    'CONFIRMED_3M_SWING', 40, round(blended, 4)), 'QUALIFIED'
     if reward < cfg.min_reward_risk:
         return None, 'INSUFFICIENT_REWARD_TO_10M_TARGET'
     t2 = next_oi_objective(levels, side, t1, atr, separation=max(.8 * atr, .45 * risk))
@@ -1329,8 +1209,8 @@ def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel],
                     round(risk, 4), round(reward, 4), policy), 'QUALIFIED'
 
 
-def live_contract(candidate: OptionCandidate, quote: dict | None, now: datetime,
-                  index_time: datetime, row: dict, cfg: Config) -> dict:
+def live_contract(row: dict, quote: dict | None, now: datetime, index_time: datetime,
+                  band: StrikeBand, offset: int, cfg: Config) -> dict:
     checked_quote(quote, now, cfg.quote_max_age_seconds)
     assert quote is not None
     seen = timestamp(quote['timestamp'])
@@ -1345,13 +1225,12 @@ def live_contract(candidate: OptionCandidate, quote: dict | None, now: datetime,
         raise DataError('INVALID_LIVE_SPREAD_OR_LOT')
     if depth < cfg.min_depth_lots:
         raise DataError('INSUFFICIENT_LIVE_DEPTH')
-    return {'instrument_key': candidate.row.key, 'side': candidate.row.side,
-            'strike': candidate.row.strike, 'atm': candidate.atm, 'offset': candidate.offset,
+    pair = band.pairs[offset]
+    return {'instrument_key': row['instrument_key'], 'side': row['instrument_type'],
+            'strike': pair.strike, 'atm': band.atm, 'offset': offset,
             'expiry': row['expiry'], 'bid': bid, 'ask': ask, 'spread_pct': round(spread, 4),
             'depth_lots': depth, 'lot_size': int(lot), 'quote_time': seen.isoformat(),
-            'oi_change_pct': round(100 * candidate.change, 6),
-            'oi_entry_threshold_pct': candidate.threshold_bps / 100,
-            'oi_previous': candidate.prior_oi, 'oi_current': candidate.row.oi}
+            'paired_oi_at_contract': pair.public()}
 
 
 class Upstox:
@@ -1755,14 +1634,6 @@ def checked_quote(q:dict|None,now:datetime,max_age:float,field='last_price')->fl
     return price
 
 
-def position_spot(quotes: dict, position: dict, now: datetime, cfg: Config) -> float:
-    quote = quotes.get(INDEX)
-    spot = checked_quote(quote, now, cfg.quote_max_age_seconds)
-    if timestamp(quote['timestamp']) < timestamp(position['opened_at']):
-        raise DataError('INDEX_QUOTE_PREDATES_POSITION')
-    return spot
-
-
 # ----------------------- Chronological position management -----------------
 
 def position_event_payload(p:dict,now:datetime,**more):
@@ -1944,7 +1815,7 @@ def prior_context(engine: dict, api, now: datetime) -> list[Candle]:
 def price_history(bars: list[Candle], prior_ten: list[Candle],
                   session_open: datetime) -> tuple[PriceContext, list[Signal], list[dict]]:
     # A full causal walk makes the recovered state independent of missed
-    # scheduler invocations. Only the last three closed minutes can alert.
+    # scheduler invocations. Observe the most recent eligible trigger window.
     previous = None
     reversals = SessionReversals()
     live: dict[str, Signal] = {}
@@ -1954,79 +1825,169 @@ def price_history(bars: list[Candle], prior_ten: list[Candle],
             previous = None
             reversals = SessionReversals()
         previous, signals = market_signals(bars[:i], prior_ten, session_open, previous, reversals)
-        if i >= len(bars)-2:
+        if bar_end(bars[-1]) - previous.at <= MAX_TRIGGER_AGE:
             for signal in signals:
                 live.setdefault(signal.identity, signal)
             examined.append({'at': previous.at.isoformat(), 'trend': previous.trend,
                              'protected': previous.protected, 'range': previous.range_bounds,
                              'market_state': price_public(previous.phase),
-                             'signals': [price_public(s) for s in signals]})
+                             'signals': [price_public(s) for s in signals],
+                             'watches': reversals.watches(bars[i-1].close, LEVEL_STRIKE_TOLERANCE)})
     assert previous is not None
     return previous, list(live.values()), jsonable(examined)
 
 
-def safe_price_direction(signal: Signal, ctx: PriceContext, bars: list[Candle],
-                         spot: float, cfg: Config) -> str | None:
-    side, atr = signal.side, ctx.atr
-    reversal = signal.reversal is not None or signal.scenario in ('DOUBLE_BOTTOM', 'DOUBLE_TOP')
-    failed = signal.scenario == 'FAILED_PULLBACK'
-    transition = ctx.phase.transition
-    if transition is not None:
-        if not reversal or (transition.side == side and ctx.phase.reason in
-                            ('MIXED_NEAR_SESSION_HIGH', 'MIXED_NEAR_SESSION_LOW')):
+def price_confirmation(signal: Signal, ctx: PriceContext, bars: list[Candle],
+                       spot: float, cfg: Config) -> str | None:
+    side = signal.side
+    if signal.at <= bars[0].start:
+        return 'CONTIGUOUS_TRIGGER_UNAVAILABLE'
+    if signal.reversal is not None:
+        if not confirmed_reversal(signal, bars):
+            return 'REVERSAL_SWING_NOT_ACCEPTED'
+    else:
+        if ctx.trend == -side and ctx.recovery_side != side:
+            return 'OPPOSITE_PROTECTED_TREND'
+        if ctx.phase.transition is not None:
             return ctx.phase.reason
-    if ctx.phase.kind == 'MIXED' and signal.scenario in ('TREND_RESUMPTION', 'PULLBACK_CONTINUATION',
-                                                         'FAILED_PULLBACK'):
-        return ctx.phase.reason
-    established = ctx.trend
-    if established == -side and not reversal and ctx.recovery_side != side:
-        return 'OPPOSITE_PROTECTED_TREND'
-    if reversal and established == -side and not confirmed_reversal(signal, bars, atr):
-        return 'COUNTERTREND_REVERSAL_NOT_CONFIRMED'
-    if failed and ctx.trend != side:
-        return 'PULLBACK_TREND_LOST'
-    defended = ctx.defends_resistance if side == 1 else ctx.defends_support
-    accepted = signal.scenario in ('ACCEPTED_BREAKOUT', 'ACCEPTED_BREAKDOWN')
-    if defended and (accepted or reversal or failed or ctx.recovery_side == side):
-        opposing = ctx.resistances if side == 1 else ctx.supports
-        for level in opposing:
-            clearance = .45 * atr if signal.reversal is not None and level.strength == 2 else .75 * atr
-            near = -.15*atr <= side * (level.price - spot) <= clearance
-            if near and level.strength >= 2 and not closes_through(bars, side, level.price, max(.6, .11*atr)):
-                return 'NEARBY_CONFIRMED_OPPOSING_LEVEL'
-    if defended and not accepted and not reversal and not failed and ctx.recovery_side != side:
-        return 'OPPOSING_PRICE_LEVEL_DEFENDED'
-    if (ctx.recovery_side == -side and ctx.recovery_level is not None
-            and abs(spot - ctx.recovery_level) <= (.55 if is_zone_rotation(signal) else 2.2) * atr
-            and not (failed and side * (spot - ctx.recovery_level) >= .35 * atr)
-            and not closes_through(bars, side, ctx.recovery_level, max(.6, .11*atr))):
-        return 'OPPOSING_REVERSAL_LEVEL_STILL_DEFENDED'
-    if failed:
-        # Discovery already verified the preceding aligned 3m progression.
-        # Keep that evidence only while the renewed 1m leg still holds.
-        recent = [b for b in bars if signal.at - MINUTE <= b.start]
-        if not recent or side * (recent[-1].close - signal.trigger) < -.10 * atr:
-            return 'PULLBACK_TRIGGER_LOST'
-    elif not pressure(bars, side, atr):
+    steps = directional_steps(bars, side)
+    if not steps or sum(steps) < .10 * ctx.atr3:
         return 'THREE_MINUTE_PRICE_NOT_ALIGNED'
     if side * (signal.trigger - signal.invalidation) <= 0:
         return 'INVALID_STRUCTURAL_STOP'
-    if side * (spot - signal.invalidation) <= 0:
-        return 'STRUCTURE_INVALIDATED'
-    since_trigger = [b for b in bars if b.start >= signal.at]
-    if any(side * ((b.low if side == 1 else b.high) - signal.invalidation) <= 0 for b in since_trigger):
+    if side * (spot - signal.invalidation) <= 0 or any(
+        side * (edge_price(bar, side) - signal.invalidation) < 0
+        for bar in bars if bar.start >= signal.at
+    ):
         return 'STRUCTURE_INVALIDATED_AFTER_TRIGGER'
     extension = side * (spot - signal.trigger)
     if extension < 0:
         return 'LIVE_PRICE_BACK_BEHIND_TRIGGER'
-    initial_distance = side * (signal.trigger - signal.invalidation)
-    if failed:
-        initial_distance += stop_buffer(atr, ctx.atr3)
-    if extension > cfg.max_chase_atr * atr or extension > .90 * initial_distance:
+    if (extension > cfg.max_chase_atr * ctx.atr
+            or extension > .90 * side * (signal.trigger - signal.invalidation)
+            or abs(spot - bars[-1].close) > 1.7 * ctx.atr):
         return 'ENTRY_EXTENDED'
-    if abs(spot - bars[-1].close) > 1.7 * atr:
-        return 'LIVE_SPOT_TOO_FAR_FROM_RECENT_CLOSE'
     return None
+
+
+@dataclass(frozen=True)
+class EntrySetup:
+    signal: Signal
+    plan: RiskPlan
+    oi_pair: OIPair
+    stop_reference: float
+
+
+@dataclass(frozen=True)
+class MarketReading:
+    spot: float
+    spot_source: str
+    grid: list[float]
+    pairs: dict[float, OIPair]
+    band: StrikeBand | None
+
+    @classmethod
+    def observe(cls, spot: float, source: str, contracts: list[dict], window: OIWindow | None):
+        grid = listed_strikes(contracts)
+        pairs = paired_oi(window)
+        return cls(spot, source, grid, pairs, StrikeBand.build(grid, spot, pairs))
+
+    def public(self, context: PriceContext, bars: list[Candle]) -> dict:
+        steps = directional_steps(bars, 1)
+        delta = sum(steps) if steps else None
+        if delta is None:
+            direction = 'UNAVAILABLE'
+        elif abs(delta) < .10 * context.atr3:
+            direction = 'BALANCED'
+        else:
+            direction = 'UP' if delta > 0 else 'DOWN'
+        range_levels = context.range_bounds
+        range_pairs = [found[0] for level in range_levels or ()
+                       if (found := pairs_at(level, self.grid, self.pairs))]
+        sideways = bool(range_levels and range_levels[0] <= self.spot <= range_levels[1]
+                        and len(range_pairs) == 2 and all(pair.state == 'QUIET' for pair in range_pairs)
+                        and context.phase.transition is None)
+        return {'spot': self.spot, 'spot_source': self.spot_source, 'move_3m': delta,
+                'atr_3m': context.atr3, 'direction_3m': direction,
+                'market_state': 'SIDEWAYS' if sideways else context.phase.kind,
+                'range_oi': [pair.public() for pair in range_pairs],
+                'strike_band': self.band.public() if self.band is not None else None}
+
+
+def signal_priority(signal: Signal) -> int:
+    return {'DOUBLE_BOTTOM': 0, 'DOUBLE_TOP': 0, 'OPENING_MOMENTUM': 1,
+            'FAILED_PULLBACK': 2, 'PULLBACK_CONTINUATION': 2, 'ACCEPTED_BREAKOUT': 3,
+            'ACCEPTED_BREAKDOWN': 3, 'RANGE_EDGE': 4, 'TREND_RESUMPTION': 5}[signal.scenario]
+
+
+def reversal_can_retire(position: dict, signal: Signal, bars: list[Candle],
+                        outbox: list[dict]) -> bool:
+    old_side = 1 if position['direction'] == 'BULLISH' else -1
+    if (signal.reversal is None or signal.side != -old_side
+            or signal.at <= timestamp(position['opened_at'])):
+        return False
+    level = position.get('setup_invalidation')
+    if level is None:
+        for event in reversed(outbox):
+            details = event.get('details') or {}
+            if event.get('kind') == 'ENTRY' and details.get('position_id') == position['id']:
+                level = (details.get('signal') or {}).get('invalidation')
+                break
+    if level is None:
+        level = position.get('initial_stop', position['stop'])
+    return closes_through(bars, -old_side, level, 0)
+
+
+def evaluate_setups(signals: list[Signal], context: PriceContext, bars: list[Candle],
+                    session_open: datetime, reading: MarketReading, window: OIWindow,
+                    slot: datetime, consumed: list[str], cfg: Config
+                    ) -> tuple[list[dict], list[EntrySetup], list[Signal]]:
+    decisions: list[dict] = []
+    setups: list[EntrySetup] = []
+    confirmed: list[Signal] = []
+    threes = aggregate(bars, 3, session_open)
+    recent = contiguous_tail(bars)
+    ordered = sorted(signals, key=lambda s: (signal_priority(s), -s.at.timestamp(), s.identity))
+    for signal in ordered:
+        pairs = pairs_at(signal.level, reading.grid, reading.pairs)
+        detail = {'signal': price_public(signal), 'identity': signal.identity,
+                  'paired_oi_at_level': [pair.public() for pair in pairs]}
+        decisions.append(detail)
+        if signal.identity in consumed:
+            detail['reason'] = 'SIGNAL_ALREADY_USED'
+            continue
+        if not timedelta(0) <= slot - signal.at <= MAX_TRIGGER_AGE:
+            detail['reason'] = 'PRICE_TRIGGER_EXPIRED'
+            continue
+        reason = price_confirmation(signal, context, recent, reading.spot, cfg)
+        if reason is not None:
+            detail['reason'] = reason
+            continue
+        if not pairs:
+            detail['reason'] = 'NO_STRIKE_NEAR_TRIGGER_LEVEL'
+            continue
+        # For a price zone use its nearest listed strike; never substitute
+        # a distant supportive pair for a quiet or opposing pair on the level.
+        pair = pairs[0]
+        expected = 'BULLISH' if signal.side == 1 else 'BEARISH'
+        if pair.state != expected:
+            detail['reason'] = {'MISSING': 'PAIRED_OI_UNAVAILABLE',
+                                'QUIET': 'PAIRED_OI_UNDER_2_PERCENT'}.get(
+                                    pair.state, 'PAIRED_OI_DIRECTION_MISMATCH')
+            continue
+        confirmed.append(signal)
+        reference = next((bar for bar in reversed(threes)
+                          if bar_end(bar, 3) <= signal.at - MINUTE), None)
+        if reference is None:
+            detail['reason'] = 'PREVIOUS_3M_CLOSE_UNAVAILABLE'
+            continue
+        levels = oi_levels(window, reading.spot, signal.side, context.atr)
+        plan, reason = risk_plan(signal, context, levels, reading.spot, cfg, reference.close)
+        detail.update(reason=reason, stop_reference_3m=reference.close)
+        if plan is not None:
+            detail['plan'] = asdict(plan)
+            setups.append(EntrySetup(signal, plan, pair, reference.close))
+    return decisions, setups, confirmed
 
 
 def scan(state: dict, api, cfg: Config, clock_fn=None,
@@ -2048,14 +2009,13 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     now = clock()
     engine = ensure_engine(state, now)
     active = state.get('position')
-    rotation_from = None
     result = {'version': VERSION, 'at': now.isoformat(), 'session_date': now.date().isoformat(),
               'decision': 'NO_TRADE', 'reason': 'UNSET', 'alerts_created': [],
               'position_locked': bool(active), 'evaluations': []}
 
     def no_trade(reason: str):
-        if rotation_from is not None:
-            result['rotation_check'] = reason
+        if result['decision'] in ('POSITION_OPEN', 'POSITION_CLOSED'):
+            result['entry_check'] = reason
         else:
             result['reason'] = reason
         return result, times
@@ -2126,31 +2086,10 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     result['candle_coverage'] = price.audit(price_slot(now))
     engine['closed_candles'] = [serialize_bar(bar) for bar in price.bars]
 
-    early_baseline = max(day_time(now, 9, 18), session_open + 3 * MINUTE)
+    early_baseline = session_open
     if not active and now < early_baseline:
         return no_trade('BEFORE_FIRST_OI_BASELINE')
-    spot_for_management = None
-    managed = None
-    management_events = []
-    management_warnings = []
-    closed_before_capture = False
-    if active:
-        try:
-            quotes = api.quotes([INDEX])
-            now = clock()
-            spot_for_management = position_spot(quotes, active, now, cfg)
-        except (DataError, ProviderError, KeyError) as exc:
-            now = clock()
-            result['quote_error'] = str(exc)
-        managed, management_events, closed, management_warnings = manage_reference(
-            active, price.bars, spot_for_management, now, deadline, cfg
-        )
-        if closed is not None:
-            save_position(managed, management_events, closed, management_warnings, at=now)
-            closed_before_capture = True
-
     window = None
-    chain: list[dict] = []
     contracts: list[dict] = []
     # Index candles and OI have independent publication and receipt times.
     # Stamp each snapshot at receipt, even if a candle or a network call crossed a minute.
@@ -2185,7 +2124,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         slot = price_slot(now)
     repolled = False
     slot_ends = slot + MINUTE + timedelta(seconds=cfg.feed_grace_seconds)
-    if (not active and price.through != slot and price_slot(now) == slot
+    if (price.through != slot and price_slot(now) == slot
             and now + CANDLE_REFRESH_REQUEST_BUDGET < min(slot_ends, deadline)):
         # The chain request already gave the feed time to publish. Use one
         # opportunistic refresh, then work from the available closed evidence.
@@ -2199,213 +2138,190 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
     if repolled:
         result['candle_coverage']['recovered_on_repoll'] = through == entry_slot
 
-    if active and not closed_before_capture:
-        if window and spot_for_management is not None and bars and managed['t1_hit']:
-            try:
-                fresh = api.quotes([INDEX])
-                now = clock()
-                fresh_spot = position_spot(fresh, managed, now, cfg)
-                managed, extra, closed, warnings = manage_reference(managed, bars, fresh_spot, now, deadline, cfg)
-                management_events.extend(extra)
-                management_warnings.extend(warnings)
-                if managed is not None and price.covers_entry(price_slot(now)) and price_slot(now) == entry_slot:
-                    management_events.extend(refine_reference(managed, bars, fresh_spot, window, now,
-                                                              session_open=session_open))
-            except (DataError, ProviderError, KeyError) as exc:
-                now = clock()
-                result['refinement_error'] = str(exc)
-        elif (spot_for_management is not None and bars and managed['t1_hit']
-              and price.covers_entry(price_slot(now))
-              and now < deadline):
-            management_events.extend(refine_reference(managed, bars, spot_for_management, None, now,
-                                                      session_open=session_open))
-        if managed is not None and now >= deadline:
-            managed, extra, closed, warnings = manage_reference(managed, [], None, now, deadline, cfg)
-            management_events.extend(extra)
-            management_warnings.extend(warnings)
-        save_position(managed, management_events, closed, management_warnings, at=now)
-        if managed is not None and spot_for_management is None and not bars:
-            result.update(decision='POSITION_MONITORING_UNAVAILABLE', reason='PRICE_FEED_UNAVAILABLE')
-        # A reversal can replace only the remainder of a trade that already
-        # realized T1. Leave that position intact unless the new contract,
-        # price, OI and risk all qualify in the same observation.
-        if managed is not None and managed['t1_hit'] and window and spot_for_management is not None:
-            rotation_from = managed
-
-    # Market state is an observation in its own right, even when OI, quote,
-    # time or an existing position prevents a new entry.
-    signals = []
-    if bars:
-        prior_ten = prior_context(engine, api, now)
+    quotes: dict = {}
+    index_spot = None
+    quote_time = None
+    try:
+        quotes = api.quotes([INDEX])
         now = clock()
-        context, signals, recent = price_history(bars, prior_ten, session_open)
-        result['price'] = {'as_of': context.at.isoformat(),
-                           'atr_1m': context.atr, 'atr_3m': context.atr3, 'atr_10m': context.atr10,
-                           'trend': context.trend, 'protected': context.protected, 'range': context.range_bounds,
-                           'last_established_side': context.last_established_side,
-                           'market_state': price_public(context.phase),
-                           'recovery_side': context.recovery_side, 'recovery_level': context.recovery_level,
-                           'defended_support': context.defends_support,
-                           'defended_resistance': context.defends_resistance,
-                           'observations': recent}
-    if active and rotation_from is None:
-        return result, times
+        quote = quotes.get(INDEX)
+        index_spot = checked_quote(quote, now, cfg.quote_max_age_seconds)
+        quote_time = timestamp(quote['timestamp'])
+    except (DataError, ProviderError, KeyError) as exc:
+        now = clock()
+        result['quote_error'] = str(exc)
 
-    if now < max(day_time(now, *ENTRY_START), session_open+6*MINUTE):
-        return no_trade('COLLECTING_OPENING_BASELINE')
-    last_entry = min(day_time(now, *ENTRY_END), deadline - 10*MINUTE)
-    if now >= last_entry:
-        return no_trade('OUTSIDE_ENTRY_WINDOW')
+    if active is not None:
+        observed = index_spot if quote_time is not None and quote_time >= timestamp(active['opened_at']) else None
+        managed, events, closed, warnings = manage_reference(active, bars, observed, now, deadline, cfg)
+        if (managed is not None and managed['t1_hit'] and observed is not None
+                and price.covers_entry(price_slot(now)) and now < deadline):
+            events.extend(refine_reference(managed, bars, observed, window, now,
+                                            session_open=session_open))
+        save_position(managed, events, closed, warnings, at=now)
+        if managed is not None and observed is None and not bars:
+            result.update(decision='POSITION_MONITORING_UNAVAILABLE', reason='PRICE_FEED_UNAVAILABLE')
+
     if not bars:
         return no_trade('NO_COMPLETED_SESSION_CANDLES')
+    prior_ten = prior_context(engine, api, now)
+    now = clock()
+    context, signals, recent = price_history(bars, prior_ten, session_open)
+    spot = index_spot if index_spot is not None else bars[-1].close
+    reading = MarketReading.observe(spot, 'INDEX_QUOTE' if index_spot is not None else 'CANDLE_CLOSE',
+                                    contracts, window)
+    result['price'] = {'as_of': context.at.isoformat(), 'atr_1m': context.atr, 'atr_3m': context.atr3,
+                       'atr_10m': context.atr10, 'trend': context.trend, 'protected': context.protected,
+                       'range': context.range_bounds, 'market_state': price_public(context.phase),
+                       'observations': recent}
+    assessment = reading.public(context, bars)
+    watches = list(recent[-1]['watches'])
+    tracked_levels = (
+        ('PROTECTED_STRUCTURE', context.protected),
+        ('REVERSAL_STRUCTURE', context.recovery_level),
+        ('POSITION_ENTRY_LEVEL', active.get('setup_level') if active else None),
+    )
+    for source, level in tracked_levels:
+        if level is not None and all(watch['level'] != level for watch in watches):
+            watches.append({'level': level, 'source': source})
+    assessment['watched_levels'] = [
+        {**watch, 'paired_oi': [pair.public() for pair in pairs_at(watch['level'], reading.grid, reading.pairs)]}
+        for watch in watches
+    ]
+    result['market_assessment'] = assessment
+
+    if now < max(day_time(now, *ENTRY_START), session_open + 6 * MINUTE):
+        return no_trade('COLLECTING_OPENING_BASELINE')
     if not price.covers_entry(entry_slot):
         return no_trade('CLOSED_PRICE_TOO_OLD_FOR_ENTRY')
     if price.tail_size < 6:
         return no_trade('INSUFFICIENT_CONTIGUOUS_PRICE_HISTORY')
-    last_exit = state.get('last_exit')
-    if last_exit and now - timestamp(last_exit['at']) < cfg.cooldown_minutes * MINUTE:
-        return no_trade('POST_EXIT_COOLDOWN')
-
-    if rotation_from is not None:
-        existing = 1 if rotation_from['direction'] == 'BULLISH' else -1
-        signals = [signal for signal in signals if signal.side == -existing and is_zone_rotation(signal)]
-    if not signals:
-        return no_trade(context.phase.reason if context.phase.transition else 'NO_FRESH_PRICE_TRIGGER')
-    signals = [signal for signal in signals if timedelta(0) <= entry_slot - signal.at <= MAX_TRIGGER_AGE]
-    if not signals:
-        return no_trade('PRICE_TRIGGER_EXPIRED')
     if window is None:
         return no_trade('OI_WINDOW_UNAVAILABLE')
     if price_slot(now) != entry_slot:
         return no_trade('PRICE_WINDOW_ROLLED_DURING_SNAPSHOT')
+    if quote_time is None or quote_time < entry_slot:
+        return no_trade('INDEX_QUOTE_UNAVAILABLE_FOR_ENTRY')
+    if reading.band is None:
+        return no_trade('ATM_STRIKE_BAND_UNAVAILABLE')
 
-    preliminary = bars[-1].close
-    grid = listed_strikes(contracts)
-    span = 1.7 * context.atr
-    plausible_spots = {preliminary - span, preliminary, preliminary + span}
-    plausible_spots.update(strike for strike in grid if abs(strike - preliminary) <= span)
-    # Prefetch at the floor. Final ranking uses each setup's live threshold.
-    desired_keys = {candidate.row.key for side in {signal.side for signal in signals}
-                    for price in plausible_spots
-                    for candidate in rank_options(window, grid, side, price, cfg.oi_entry_floor_bps)[0]}
-    desired = [INDEX, *sorted(desired_keys)]
-    try:
-        quotes = api.quotes(desired)
-    except (DataError, ProviderError) as exc:
-        result['quote_error'] = str(exc)
-        return no_trade('ENTRY_QUOTE_REQUEST_FAILED')
-    now = clock()
-    if now >= last_entry or price_slot(now) != entry_slot:
-        return no_trade('DECISION_WINDOW_EXPIRED_DURING_QUOTE_FETCH')
-    quote = quotes.get(INDEX)
-    try:
-        spot = checked_quote(quote, now, cfg.quote_max_age_seconds)
-        quote_time = timestamp(quote['timestamp'])
-    except (DataError, KeyError):
-        return no_trade('INDEX_QUOTE_UNAVAILABLE')
-    if quote_time < entry_slot:
-        return no_trade('INDEX_QUOTE_PREDATES_DECISION_WINDOW')
-    result['entry_evidence'] = {'index_quote_at': quote_time.isoformat(),
-                                'index_quote': spot,
-                                'decision_through': entry_slot.isoformat(),
-                                'candle_through': through.isoformat(),
+    result['entry_evidence'] = {'index_quote_at': quote_time.isoformat(), 'index_quote': spot,
+                                'decision_through': entry_slot.isoformat(), 'candle_through': through.isoformat(),
                                 'candle_lag_minutes': (entry_slot - through) // MINUTE}
-
-    front = {r['instrument_key']: r for r in chain}
     consumed = engine['consumed_signals']
-    last_fill = engine.get('last_entry_through')
-    if last_fill == through.isoformat():
+    decisions, setups, confirmed = evaluate_setups(
+        signals, context, bars, session_open, reading, window, entry_slot, consumed, cfg)
+    result['evaluations'] = decisions
+    if assessment['market_state'] == 'SIDEWAYS':
+        return no_trade('SIDEWAYS_NO_DIRECTIONAL_ENTRY')
+
+    position = state.get('position')
+    if position is not None:
+        reversal = next((signal for signal in confirmed
+                         if reversal_can_retire(position, signal, bars, state['outbox'])), None)
+        if reversal is None:
+            return no_trade('EXISTING_POSITION_REMAINS_VALID')
+        rotated = close_reference(position, now, 'CONFIRMED_ZONE_REVERSAL', spot, 'FRESH_PRICE_AND_PAIRED_OI')
+        exit_details = position_event_payload(
+            position, now, reason=rotated['exit_reason'], underlying_reference=spot,
+            source=rotated['exit_source'], signal=price_public(reversal))
+        save_position(None, [('EXIT', exit_details)], rotated, result.get('management_warnings', []), at=now)
+        result['rotated_from'] = position['id']
+        setups = [setup for setup in setups if setup.signal.identity == reversal.identity]
+
+    last_entry = min(day_time(now, *ENTRY_END), deadline - 10 * MINUTE)
+    if now >= last_entry:
+        return no_trade('OUTSIDE_ENTRY_WINDOW')
+    if engine.get('last_entry_through') == through.isoformat():
         return no_trade('SIGNAL_WINDOW_ALREADY_USED')
-    priority = {'DOUBLE_BOTTOM': 0, 'DOUBLE_TOP': 0, 'SWEEP_RETEST': 0, 'OPENING_MOMENTUM': 1,
-                'FAILED_PULLBACK': 2, 'ACCEPTED_BREAKOUT': 3, 'ACCEPTED_BREAKDOWN': 3,
-                'PULLBACK_CONTINUATION': 4, 'RANGE_EDGE': 5, 'TREND_RESUMPTION': 6}
-    eligible = []
-    for signal in sorted(signals, key=lambda x: (priority[x.scenario], x.at, x.identity)):
-        details = {'signal': price_public(signal), 'identity': signal.identity}
-        result['evaluations'].append(details)
-        if signal.identity in consumed:
-            details['reason'] = 'SIGNAL_ALREADY_USED'
-            continue
-        reason = safe_price_direction(signal, context, bars, spot, cfg)
-        if reason:
-            details['reason'] = reason
-            continue
-        supported, level_detail = level_confirmation(signal, context, window, spot)
-        details['oi_structure'] = level_detail
-        if not supported:
-            details['reason'] = 'OI_LEVELS_DO_NOT_CONFIRM_PRICE'
-            continue
-        threshold = entry_oi_threshold(signal, context, bars, spot, cfg)
-        details['oi_entry_threshold'] = {'pct': threshold.bps / 100, 'reason': threshold.reason}
-        candidates, compared = rank_options(window, grid, signal.side, spot, threshold.bps)
-        details['oi_candidates'] = compared
-        details['candidate_ranking'] = [asdict(c) for c in candidates]
-        if not candidates:
-            if not compared:
-                details['reason'] = 'ATM_OFFSETS_UNAVAILABLE'
-            elif any(x['status'] != 'MATCHED' for x in compared):
-                details['reason'] = 'CANDIDATE_OI_COMPARISON_INCOMPLETE'
-            else:
-                details['reason'] = 'NO_OPTION_OI_CHANGE_ABOVE_ENTRY_THRESHOLD'
-            continue
-        plan, reason = risk_plan(signal, context, oi_levels(window, spot, signal.side, context.atr), spot, cfg)
-        details['reason'] = reason
-        if plan:
-            details['plan'] = asdict(plan)
-            eligible.append((signal, plan, candidates, details))
-    if not eligible:
-        reasons = {item['reason'] for item in result['evaluations']}
-        if context.phase.kind == 'MIXED' and reasons == {context.phase.reason}:
-            return no_trade(context.phase.reason)
-        return no_trade('PRICE_OI_OR_RISK_REQUIREMENTS_NOT_MET')
-    if len({signal.side for signal, *_ in eligible}) > 1:
+    if not setups:
+        return no_trade('NO_QUALIFIED_PRICE_OI_AND_RISK_SETUP' if signals else 'NO_FRESH_PRICE_TRIGGER')
+    if len({setup.signal.side for setup in setups}) != 1:
         return no_trade('CONFLICTING_QUALIFIED_DIRECTIONS')
 
-    for signal, plan, candidates, details in eligible:
-        details['contract_rejections'] = []
-        for candidate in candidates:
-            key = candidate.row.key
-            if key not in desired:
-                details['contract_rejections'].append({'key': key, 'reason': 'ATM_MOVED_OUTSIDE_QUOTED_GRID'})
-                break
-            try:
-                contract = live_contract(candidate, quotes.get(key), now, quote_time, front[key], cfg)
-            except (DataError, KeyError, ValueError, TypeError) as exc:
-                details['contract_rejections'].append({'key': key, 'reason': str(exc)})
-                continue
-            position_id = hashlib.sha256(
-                f'{now.date()}|{signal.identity}|{key}'.encode()
-            ).hexdigest()[:22]
-            direction = 'BULLISH' if signal.side == 1 else 'BEARISH'
-            position = {'id': position_id, 'status': 'OPEN', 'direction': direction,
-                        'side': contract['side'], 'strike': contract['strike'], 'expiry': contract['expiry'],
-                        'instrument_key': key, 'opened_at': now.isoformat(), 'entry_spot': spot,
-                        'entry_ask': contract['ask'], 'initial_stop': plan.stop,
-                        'last_candle': bars[-1].start.isoformat(), 'scenario': signal.scenario,
-                        't1_hit': False, 'remaining_pct': 100, 'contract': contract, **asdict(plan)}
-            if rotation_from is not None:
-                rotated = close_reference(rotation_from, now, 'CONFIRMED_ZONE_REVERSAL', spot,
-                                          'FRESH_PRICE_OI_AND_NEW_CONTRACT')
-                close_event = ('EXIT', position_event_payload(
-                    rotation_from, now, reason=rotated['exit_reason'], underlying_reference=spot,
-                    source=rotated['exit_source'], replacement_position_id=position_id,
-                    signal=price_public(signal)))
-                save_position(None, [close_event], rotated, management_warnings, at=now)
-                result['rotated_from'] = rotation_from['id']
-            state['position'] = position
-            engine['last_entry_through'] = through.isoformat()
-            engine['consumed_signals'] = (consumed + [s.identity for s, *_ in eligible])[-160:]
-            event_id = new_event(state, 'ENTRY', position_event_payload(
-                position, now, reason='QUALIFIED_PRICE_AND_3M_OI', signal=price_public(signal),
-                plan=asdict(plan), entry_evidence=result['entry_evidence'],
-                oi={'window': result['oi'], 'contract': contract,
-                                      'entry_threshold': details['oi_entry_threshold'],
-                                      'price_levels': details['oi_structure']}), now)
-            result['alerts_created'].append(event_id)
-            result.update(decision='ENTRY', reason='QUALIFIED_' + contract['side'],
-                          position_locked=True, selected_position=position)
-            return result, times
-    return no_trade('NO_LIQUID_CONTRACT_IN_OI_RANKING')
+    # Evaluate the market before deciding if a same-side re-entry is allowed.
+    setup = setups[0]
+    signal, plan = setup.signal, setup.plan
+    direction = 'BULLISH' if signal.side == 1 else 'BEARISH'
+    last_exit = state.get('last_exit')
+    if (last_exit and last_exit['direction'] == direction
+            and now - timestamp(last_exit['at']) < cfg.cooldown_minutes * MINUTE):
+        return no_trade('SAME_DIRECTION_POST_EXIT_COOLDOWN')
+
+    option_side = 'CE' if signal.side == 1 else 'PE'
+    listed = {(row['instrument_type'], float(row['strike_price'])): row for row in contracts}
+    choices = []
+    for offset in (-signal.side, -2 * signal.side):
+        pair = reading.band.pairs.get(offset)
+        if pair is None:
+            continue
+        row = listed.get((option_side, pair.strike))
+        if row is not None:
+            choices.append((offset, pair, row))
+    if not choices:
+        return no_trade('DIRECTIONAL_OFFSETS_NOT_LISTED')
+    try:
+        option_quotes = api.quotes([INDEX, *(row['instrument_key'] for _, _, row in choices)])
+        now = clock()
+        final_index = option_quotes.get(INDEX)
+        final_spot = checked_quote(final_index, now, cfg.quote_max_age_seconds)
+        final_quote_time = timestamp(final_index['timestamp'])
+    except (DataError, ProviderError, KeyError) as exc:
+        result['option_quote_error'] = str(exc)
+        return no_trade('ENTRY_QUOTE_REQUEST_FAILED')
+    if now >= last_entry or price_slot(now) != entry_slot or final_quote_time < entry_slot:
+        return no_trade('DECISION_WINDOW_EXPIRED_DURING_QUOTE_FETCH')
+
+    final_reading = MarketReading.observe(final_spot, 'INDEX_QUOTE', contracts, window)
+    if final_reading.band is None or final_reading.band.atm != reading.band.atm:
+        return no_trade('ATM_CHANGED_BEFORE_EXECUTION')
+    spot, quote_time = final_spot, final_quote_time
+    final_reason = price_confirmation(signal, context, contiguous_tail(bars), spot, cfg)
+    if final_reason is not None:
+        return no_trade(final_reason)
+    plan, final_reason = risk_plan(signal, context, oi_levels(window, spot, signal.side, context.atr),
+                                   spot, cfg, setup.stop_reference)
+    if plan is None:
+        return no_trade(final_reason)
+    result['entry_evidence'].update(index_quote_at=quote_time.isoformat(), index_quote=spot)
+
+    ranked = []
+    result['contract_checks'] = []
+    for offset, pair, row in choices:
+        key = row['instrument_key']
+        try:
+            contract = live_contract(row, option_quotes.get(key), now, quote_time, reading.band, offset, cfg)
+        except (DataError, KeyError, ValueError, TypeError) as exc:
+            result['contract_checks'].append({'strike': pair.strike, 'reason': str(exc)})
+            continue
+        result['contract_checks'].append({'strike': pair.strike, 'reason': 'QUALIFIED_QUOTE'})
+        score = pair.score(signal.side)
+        ranked.append((score is None, -(score or 0), contract['spread_pct'], -contract['depth_lots'],
+                       abs(offset), key, contract))
+    if not ranked:
+        return no_trade('NO_LIQUID_CONTRACT_IN_DIRECTIONAL_OFFSETS')
+
+    *_, key, contract = min(ranked, key=lambda item: item[:-1])
+    position_id = hashlib.sha256(f'{now.date()}|{signal.identity}|{key}'.encode()).hexdigest()[:22]
+    position = {'id': position_id, 'status': 'OPEN', 'direction': direction,
+                'side': contract['side'], 'strike': contract['strike'], 'expiry': contract['expiry'],
+                'instrument_key': key, 'opened_at': now.isoformat(), 'entry_spot': spot,
+                'entry_ask': contract['ask'], 'initial_stop': plan.stop,
+                'setup_level': signal.level, 'setup_invalidation': signal.invalidation,
+                'last_candle': bars[-1].start.isoformat(), 'scenario': signal.scenario,
+                't1_hit': False, 'remaining_pct': 100, 'contract': contract, **asdict(plan)}
+    state['position'] = position
+    engine['last_entry_through'] = through.isoformat()
+    engine['consumed_signals'] = (consumed + [item.signal.identity for item in setups])[-160:]
+    event_id = new_event(state, 'ENTRY', position_event_payload(
+        position, now, reason='QUALIFIED_PRICE_AND_3M_OI', signal=price_public(signal),
+        plan=asdict(plan), entry_evidence=result['entry_evidence'],
+        oi={'window': result['oi'], 'confirmation_pair': setup.oi_pair.public(),
+            'stop_reference_3m': setup.stop_reference, 'contract': contract}), now)
+    result['alerts_created'].append(event_id)
+    result.update(decision='ENTRY', reason='QUALIFIED_' + contract['side'],
+                  position_locked=True, selected_position=position)
+    return result, times
 
 
 def email_price(value: Any, pattern: str) -> str:
@@ -2542,6 +2458,8 @@ def environment_config() -> Config:
     try:raw=json.loads((os.environ.get('NIFTY_SCANNER_CONFIG') or '{}'))
     except json.JSONDecodeError as exc:raise ScannerError('Invalid NIFTY_SCANNER_CONFIG JSON') from exc
     if not isinstance(raw,dict):raise ScannerError('Configuration must be JSON object')
+    for legacy in ('oi_entry_floor_bps', 'oi_entry_ceiling_bps'):
+        raw.pop(legacy, None)
     try:return Config(**raw)
     except TypeError as exc:raise ScannerError('Unknown scanner configuration fields') from exc
 
