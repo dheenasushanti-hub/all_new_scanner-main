@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NIFTY scanner v132.0.0. Reference alerts using completed price and OI windows.
+"""NIFTY scanner v133.0.0. Reference alerts using completed price and OI windows.
 
 Production runs require Upstox market data and the existing dispatcher. Keep the
 existing state path and deploy this Python file and its workflow together. The
@@ -39,8 +39,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '132.0.0'
-AUDIT_RELEASE = 'v132'
+VERSION = '133.0.0'
+AUDIT_RELEASE = 'v133'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -215,11 +215,16 @@ DISPATCH_INTERVAL = 3 * MINUTE
 MAX_TRIGGER_AGE = DISPATCH_INTERVAL + MAX_ENTRY_CANDLE_LAG
 LEVEL_STRIKE_TOLERANCE = 20.0
 NIFTY_STRIKE_INTERVAL = 50.0
+T1_SPOT_BAND = (45.0, 50.0)
+T2_SPOT_BAND = (80.0, 90.0)
+SPOT_TARGET_SOURCE = 'ENTRY_SPOT_DISTANCE'
+BOUNDED_TARGET_SOURCES = frozenset({SPOT_TARGET_SOURCE, 'OI_IN_SPOT_BAND', '10M_IN_SPOT_BAND'})
 CANDLE_REFRESH_REQUEST_BUDGET = timedelta(seconds=16)
 # Separate from strike eligibility. Used when judging changes in the OI map.
 OI_LEVEL_MATERIAL_CHANGE = .02
 CONTINUATION_SCENARIOS = frozenset({'FAILED_PULLBACK', 'PULLBACK_CONTINUATION', 'TREND_RESUMPTION',
-                                    'ACCEPTED_BREAKOUT', 'ACCEPTED_BREAKDOWN', 'OPENING_MOMENTUM'})
+                                    'ACCEPTED_BREAKOUT', 'ACCEPTED_BREAKDOWN', 'BREAK_PULLBACK',
+                                    'OPENING_MOMENTUM'})
 
 
 def bar_end(bar: Candle, duration: int = 1) -> datetime:
@@ -323,6 +328,12 @@ class ReversalEvidence:
 
 
 @dataclass(frozen=True)
+class BreakPullback:
+    break_at: datetime
+    break_trigger: float
+
+
+@dataclass(frozen=True)
 class Signal:
     side: int
     scenario: str
@@ -332,6 +343,7 @@ class Signal:
     invalidation: float
     level: float
     reversal: ReversalEvidence | None = None
+    pullback: BreakPullback | None = None
 
     @property
     def identity(self) -> str:
@@ -1155,11 +1167,13 @@ def stop_buffer(atr_1m: float, atr_3m: float = 0) -> float:
 
 
 def next_oi_objective(levels: list[OILevel], side: int, beyond: float,
-                      atr: float, separation: float = 0) -> float | None:
+                      atr: float, *, target_band: tuple[float, float] | None = None) -> float | None:
     for row in levels:
-        objective = row.strike - side * max(.5, .10 * atr)
-        if side * (objective - beyond) > max(.4 * atr, separation):
-            return round(objective, 4)
+        objective = round(row.strike - side * max(.5, .10 * atr), 4)
+        if target_band is not None and not target_band[0] <= objective <= target_band[1]:
+            continue
+        if side * (objective - beyond) > .4 * atr:
+            return objective
     return None
 
 
@@ -1171,17 +1185,19 @@ class RiskAssessment:
 
 
 def stop_for_setup(signal: Signal, ctx: PriceContext, spot: float, cfg: Config,
-                   stop_reference: float) -> tuple[float, float]:
+                   stop_reference: float, *, retest_edge: float | None = None) -> tuple[float, float]:
     side, atr = signal.side, ctx.atr
     atr3 = ctx.atr3 if signal.scenario in CONTINUATION_SCENARIOS else 0
     # Work in the signed direction, then round outward so rounding never
     # cuts into the structural buffer. Use smaller steps in quieter markets.
-    buffered = min(side * signal.invalidation, side * stop_reference) - stop_buffer(atr, atr3)
+    boundary = signal.invalidation if retest_edge is None else retest_edge
+    buffered = min(side * boundary, side * stop_reference) - stop_buffer(atr, atr3)
     signed_stop = min(buffered, side * spot - cfg.min_stop_atr * atr)
     step = 10 if atr >= 10 else 5 if atr >= 5 else 1
     rounded = math.floor(signed_stop / step) * step
-    # A cosmetic round-out cannot disqualify a structurally valid stop.
-    stop = side * (rounded if side * spot - rounded <= cfg.max_stop_atr * atr else signed_stop)
+    # Cosmetic rounding must preserve the volatility and reward-to-risk limits.
+    rounding_budget = min(cfg.max_stop_atr * atr, T1_SPOT_BAND[1] / cfg.min_reward_risk)
+    stop = side * (rounded if side * spot - rounded <= rounding_budget else signed_stop)
     return stop, side * (spot - stop)
 
 
@@ -1202,11 +1218,13 @@ def defended_walls(levels: list[OILevel], pairs: dict[float, OIPair], bars: list
 
 def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel], spot: float,
               cfg: Config, stop_reference: float, *, pairs: dict[float, OIPair],
-              bars: list[Candle]) -> RiskAssessment:
+              bars: list[Candle], retest_edge: float | None = None) -> RiskAssessment:
     side, atr = signal.side, ctx.atr
-    stop, risk = stop_for_setup(signal, ctx, spot, cfg, stop_reference)
-    evidence = {'structural_invalidation': signal.invalidation, 'previous_3m_close': stop_reference,
+    stop, risk = stop_for_setup(signal, ctx, spot, cfg, stop_reference, retest_edge=retest_edge)
+    evidence = {'structural_invalidation': signal.invalidation if retest_edge is None else retest_edge,
+                'previous_3m_close': stop_reference,
                 'planned_stop': stop, 'risk_points': round(risk, 4),
+                'target_anchor': spot, 't1_point_band': T1_SPOT_BAND, 't2_point_band': T2_SPOT_BAND,
                 'minimum_reward_risk': cfg.min_reward_risk}
     if stop <= 0 or not 0 < risk <= cfg.max_stop_atr * atr:
         return RiskAssessment(None, 'STRUCTURAL_STOP_TOO_WIDE_OR_INVALID', evidence)
@@ -1226,49 +1244,35 @@ def risk_plan(signal: Signal, ctx: PriceContext, levels: list[OILevel], spot: fl
     evidence.update(minimum_target=round(required, 4), structural_checkpoints=checkpoints,
                     opposing_barrier=barrier)
 
-    # Prefer the nearest meaningful OI objective that can pay for the stop.
-    # Completed 10m levels are checkpoints or fallback objectives, and actual
-    # opposing price and OI can cap the route. A range edge is also a cap.
-    ranked = [(row.strike, 'OI_OBJECTIVE') for row in levels]
-    ranked.extend((level, '10M_STRUCTURE') for level in checkpoints)
-    checked = []
-    evidence['target_checks'] = checked
-    target = None
-    found_t1_without_t2 = False
-    for level, source in ranked:
-        if side * (level - spot) <= 0:
-            continue
-        if source == 'OI_OBJECTIVE' and any(
-            abs(level - checkpoint) <= LEVEL_STRIKE_TOLERANCE for checkpoint in checkpoints
-        ):
-            source = 'OI_OBJECTIVE_NEAR_10M_STRUCTURE'
-        if source == '10M_STRUCTURE':
-            level -= side * max(.5, .14 * atr)
-        reward_risk = side * (level - spot) / risk
-        if barrier is not None and side * (level - barrier) > 0:
-            reason = 'BEYOND_DEFENDED_BARRIER'
-        elif reward_risk < cfg.min_reward_risk:
-            reason = 'BELOW_MINIMUM_REWARD'
-        else:
-            t2 = next_oi_objective(levels, side, level, atr, separation=max(.8 * atr, .45 * risk))
-            reason = 'QUALIFIED' if t2 is not None else 'NO_FURTHER_OI_TARGET'
-            if t2 is None:
-                found_t1_without_t2 = True
-        checked.append({'level': round(level, 4), 'source': source,
-                        'reward_risk': round(reward_risk, 4), 'reason': reason})
-        if reason == 'QUALIFIED':
-            target = (level, source, reward_risk, t2)
-            break
+    t1_minimum = max(T1_SPOT_BAND[0], cfg.min_reward_risk * risk)
+    if t1_minimum > T1_SPOT_BAND[1] + 1e-10:
+        return RiskAssessment(None, 'NO_TARGET_MEETS_REWARD_TO_RISK', evidence)
+    t1_minimum = min(t1_minimum, T1_SPOT_BAND[1])
+    max_distance = side * (barrier - spot) if barrier is not None else math.inf
+    route = [(row.strike, 'OI_IN_SPOT_BAND') for row in levels]
+    route.extend((level, '10M_IN_SPOT_BAND') for level in checkpoints)
 
-    if target is None:
-        if found_t1_without_t2:
-            reason = 'NO_FURTHER_OI_TARGET'
-        else:
-            reason = 'DEFENDED_BARRIER_LIMITS_REWARD' if barrier is not None else 'NO_TARGET_MEETS_REWARD_TO_RISK'
+    def target(lower: float, upper: float, preferred: float) -> tuple[float, str] | None:
+        upper = min(upper, max_distance, spot - .0001 if side == -1 else math.inf)
+        if upper < lower:
+            return None
+        available = [(level, source) for level, source in route if lower <= side * (level - spot) <= upper]
+        if available:
+            return min(available, key=lambda item: (abs(side * (item[0] - spot) - preferred),
+                                                    side * item[0], item[1] != 'OI_IN_SPOT_BAND'))
+        distance = min(upper, max(lower, preferred))
+        return round(spot + side * distance, 4), SPOT_TARGET_SOURCE
+
+    first_target = target(t1_minimum, T1_SPOT_BAND[1], sum(T1_SPOT_BAND) / 2)
+    second_target = target(*T2_SPOT_BAND, sum(T2_SPOT_BAND) / 2)
+    if first_target is None or second_target is None:
+        reason = 'DEFENDED_BARRIER_LIMITS_REWARD' if barrier is not None else 'INVALID_TARGET_LEVEL'
         return RiskAssessment(None, reason, evidence)
-    t1, source, reward, t2 = target
+    t1, first_source = first_target
+    t2, second_source = second_target
+    reward = side * (t1 - spot) / risk
     policy = 'CONFIRMED_3M_SWING' if signal.scenario in CONTINUATION_SCENARIOS else 'STANDARD_POST_T1'
-    plan = RiskPlan(round(stop, 4), round(t1, 4), t2, source, 'NEXT_OI_LEVEL',
+    plan = RiskPlan(round(stop, 4), t1, t2, first_source, second_source,
                     round(risk, 4), round(reward, 4), policy)
     evidence['intermediate_levels'] = sorted(
         {level for level in checkpoints + [row.strike for row in levels]
@@ -1300,6 +1304,16 @@ def live_contract(row: dict, quote: dict | None, now: datetime, index_time: date
             'expiry': row['expiry'], 'bid': bid, 'ask': ask, 'spread_pct': round(spread, 4),
             'depth_lots': depth, 'lot_size': int(lot), 'quote_time': seen.isoformat(),
             'paired_oi_at_contract': pair.public()}
+
+
+def directional_contracts(band: StrikeBand, side: int, listed: dict) -> list[tuple[int, OIPair, dict]]:
+    option_side = 'CE' if side == 1 else 'PE'
+    choices = []
+    for offset in (-side, -2 * side):
+        pair = band.pairs.get(offset)
+        if pair is not None and (row := listed.get((option_side, pair.strike))) is not None:
+            choices.append((offset, pair, row))
+    return choices
 
 
 class Upstox:
@@ -1729,6 +1743,7 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
     side = 1 if position['direction'] == 'BULLISH' else -1
     cursor = timestamp(position['last_candle'])
     opening = timestamp(position['opened_at'])
+    t2_reason = 'SPOT_TARGET_REACHED' if position.get('t2_source') in BOUNDED_TARGET_SOURCES else 'OI_TARGET_REACHED'
     alerts: list[tuple[str, dict]] = []
     warnings: list[str] = []
 
@@ -1775,13 +1790,14 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         if side * (adverse - stop) <= 0:
             return finish('EXIT', at, 'STRUCTURAL_SL', stop, 'COMPLETED_1M_STOP_FIRST',
                           candle_observation)
+        target_observation = {**candle_observation, 'target_touch_spot': favorable,
+                              'target_touch_extreme': 'high' if side == 1 else 'low'}
         reached_t1 = not position['t1_hit'] and side * (favorable - position['t1']) >= 0
         if reached_t1:
-            hit_t1(at, 'COMPLETED_1M_HIGH_LOW', candle_observation)
-            candle_observation['stop'] = position['stop']
+            hit_t1(at, 'COMPLETED_1M_HIGH_LOW', target_observation)
+            candle_observation['stop'] = target_observation['stop'] = position['stop']
         if position['t1_hit'] and side * (favorable - t2) >= 0:
-            return finish('T2', at, 'OI_TARGET_REACHED', t2, 'COMPLETED_1M_HIGH_LOW',
-                          candle_observation)
+            return finish('T2', at, t2_reason, t2, 'COMPLETED_1M_HIGH_LOW', target_observation)
         # The new stop is active at the completed candle's timestamp. Its
         # close can trigger the stop at once, while its earlier wick cannot.
         if reached_t1 and side * (bar.close - position['stop']) <= 0:
@@ -1800,7 +1816,7 @@ def manage_reference(p: dict, bars: list[Candle], spot: float | None,
         if not position['t1_hit'] and side * (spot - position['t1']) >= 0:
             hit_t1(now, 'FRESH_INDEX_QUOTE', {'spot': spot})
         if position['t1_hit'] and side * (spot - position['t2']) >= 0:
-            return finish('T2', now, 'OI_TARGET_REACHED', spot, 'FRESH_INDEX_QUOTE')
+            return finish('T2', now, t2_reason, spot, 'FRESH_INDEX_QUOTE')
     return position, alerts, None, warnings
 
 
@@ -1850,8 +1866,11 @@ def refine_reference(position: dict, bars: list[Candle], spot: float,
 
     if window:
         levels = oi_levels(window, spot, side, atr)
+        bounded = position.get('t2_source') in BOUNDED_TARGET_SOURCES
+        target_band = tuple(sorted(round(entry + side * points, 4) for points in T2_SPOT_BAND)) if bounded else None
         objective = next_oi_objective(levels, side,
-                                      max((spot, position['t1'] + side*.8*atr), key=lambda v: side*v), atr)
+                                      max((spot, position['t1'] + side*.8*atr), key=lambda v: side*v),
+                                      atr, target_band=target_band)
         if objective is not None and abs(objective - old_t2) > .4 * atr:
             # Instead of extending a target because of noise, require that the
             # old wall has weakened in the current matched OI window.
@@ -1860,7 +1879,7 @@ def refine_reference(position: dict, bars: list[Candle], spot: float,
                            and x.increase < -OI_LEVEL_MATERIAL_CHANGE for x in window.changes)
             if side * (objective - old_t2) < 0 or old_weak:
                 position['t2'] = objective
-                position['t2_source'] = 'OI_LEVEL_AFTER_T1'
+                position['t2_source'] = 'OI_IN_SPOT_BAND' if bounded else 'OI_LEVEL_AFTER_T1'
 
     if position['stop'] == old_stop and position['t2'] == old_t2:
         return []
@@ -1923,6 +1942,15 @@ def price_history(bars: list[Candle], prior_ten: list[Candle],
 
 
 def defended_entry_retest(signal: Signal, bars: list[Candle], atr: float) -> bool:
+    if signal.scenario == 'TREND_RESUMPTION' and bar_end(bars[-1]) == signal.at:
+        # A fresh resumption may use two completed tests in its own pause.
+        # A later scan cannot reuse the pause to bypass the extension guard.
+        side, level = signal.side, signal.level
+        pause = [bar for bar in bars[-4:-1] if bar.start >= signal.origin]
+        for first, second in zip(pause, pause[1:]):
+            if (all(0 <= side * (edge_price(bar, side) - level) <= .25 * atr for bar in (first, second))
+                    and side * second.close - max(side * level, side * first.close) >= .60 * atr):
+                return True
     # Continuation signals with a pullback can use the test that produced their
     # trigger. A new break or resumption needs a test after it was established.
     start = signal.origin if signal.scenario in ('PULLBACK_CONTINUATION', 'FAILED_PULLBACK') else signal.at
@@ -1972,6 +2000,33 @@ def accepted_break_retest(signal: Signal, bars: list[Candle], spot: float, atr: 
     return None
 
 
+def breakout_pullback(signal: Signal, ctx: PriceContext, bars: list[Candle]) -> Signal | None:
+    """A defended higher low or lower high after an accepted break."""
+    side = signal.side
+    if (signal.scenario not in ('ACCEPTED_BREAKOUT', 'ACCEPTED_BREAKDOWN')
+            or ctx.trend != side or ctx.phase.transition is not None):
+        return None
+    if not MINUTE <= ctx.at - signal.at <= MAX_TRIGGER_AGE:
+        return None
+    post = [bar for bar in bars if bar_end(bar) >= signal.at]
+    if len(post) < 3 or any(side * (bar.close - signal.trigger) < 0 for bar in post):
+        return None
+    prior, test = post[-2:]
+    atr = ctx.atr
+    distance = side * (edge_price(test, side) - signal.trigger)
+    old_distance = side * (edge_price(prior, side) - signal.trigger)
+    extreme = max(side * bar.close for bar in post[:-2])
+    if (not 0 <= min(distance, old_distance) <= 1.40 * atr
+            or abs(distance - old_distance) > .25 * atr
+            or extreme - side * test.close < .40 * atr
+            or side * (test.close - prior.close) < .10 * atr):
+        return None
+    invalidation = side * min(side * edge_price(bar, side) for bar in (prior, test))
+    trigger = away_price(test, side) + side * max(.60, .10 * atr)
+    return Signal(side, 'BREAK_PULLBACK', bar_end(test), test.start, trigger, invalidation,
+                  signal.level, pullback=BreakPullback(signal.at, signal.trigger))
+
+
 @dataclass(frozen=True)
 class EntryPriceAssessment:
     reason: str | None = None
@@ -1998,10 +2053,17 @@ def price_confirmation(signal: Signal, ctx: PriceContext, bars: list[Candle], sp
     if not steps:
         return EntryPriceAssessment('THREE_MINUTE_PRICE_UNAVAILABLE')
     retest = None
-    if sum(steps) < .10 * ctx.atr3:
+    if signal.pullback is not None:
+        if not allow_live_retest:
+            return EntryPriceAssessment('BREAK_PULLBACK_NEEDS_CURRENT_QUOTE')
+        timing = 'BREAK_PULLBACK_RECLAIM'
+    elif sum(steps) < .10 * ctx.atr3:
         retest = accepted_break_retest(signal, bars, spot, ctx.atr, allow_live_retest)
         if retest is None:
             return EntryPriceAssessment('THREE_MINUTE_PRICE_NOT_ALIGNED')
+        timing = 'DEFENDED_BREAK_RETEST'
+    else:
+        timing = 'THREE_MINUTE_IMPULSE'
     if side * (signal.trigger - signal.invalidation) <= 0:
         return EntryPriceAssessment('INVALID_STRUCTURAL_STOP')
     if side * (spot - signal.invalidation) <= 0 or any(
@@ -2020,7 +2082,6 @@ def price_confirmation(signal: Signal, ctx: PriceContext, bars: list[Candle], sp
             and side * (spot - ctx.protected) > cfg.max_unretested_leg_atr * ctx.atr
             and not defended_entry_retest(signal, bars, ctx.atr)):
         return EntryPriceAssessment('EXTENDED_LEG_NEEDS_DEFENDED_RETEST')
-    timing = 'DEFENDED_BREAK_RETEST' if retest is not None else 'THREE_MINUTE_IMPULSE'
     return EntryPriceAssessment(timing=timing, retest=retest)
 
 
@@ -2070,7 +2131,7 @@ class MarketReading:
 
 def signal_priority(signal: Signal) -> int:
     return {'DOUBLE_BOTTOM': 0, 'DOUBLE_TOP': 0, 'OPENING_MOMENTUM': 1,
-            'FAILED_PULLBACK': 2, 'PULLBACK_CONTINUATION': 2, 'ACCEPTED_BREAKOUT': 3,
+            'FAILED_PULLBACK': 2, 'PULLBACK_CONTINUATION': 2, 'BREAK_PULLBACK': 2, 'ACCEPTED_BREAKOUT': 3,
             'ACCEPTED_BREAKDOWN': 3, 'RANGE_EDGE': 4, 'TREND_RESUMPTION': 5}[signal.scenario]
 
 
@@ -2102,7 +2163,14 @@ def evaluate_setups(signals: list[Signal], context: PriceContext, bars: list[Can
     threes = aggregate(bars, 3, session_open)
     recent = contiguous_tail(bars)
     allow_live_retest = quote_at is not None and context.at == slot and quote_at > context.at
-    ordered = sorted(signals, key=lambda s: (signal_priority(s), -s.at.timestamp(), s.identity))
+    entries = {signal.identity: signal for signal in signals}
+    for signal in signals:
+        if signal.identity not in consumed and (pullback := breakout_pullback(signal, context, recent)) is not None:
+            # When the same pause follows two breaks, keep the more recent anchor.
+            existing = entries.get(pullback.identity)
+            if existing is None or existing.pullback.break_at < signal.at:
+                entries[pullback.identity] = pullback
+    ordered = sorted(entries.values(), key=lambda s: (signal_priority(s), -s.at.timestamp(), s.identity))
     for signal in ordered:
         pairs = pairs_at(signal.level, reading.grid, reading.pairs, cover_strike_interval=True)
         detail = {'signal': price_public(signal), 'identity': signal.identity,
@@ -2147,7 +2215,8 @@ def evaluate_setups(signals: list[Signal], context: PriceContext, bars: list[Can
             continue
         levels = oi_levels(window, reading.spot, signal.side, context.atr)
         risk = risk_plan(signal, context, levels, reading.spot, cfg, reference.close,
-                         pairs=reading.pairs, bars=recent)
+                         pairs=reading.pairs, bars=recent,
+                         retest_edge=price_check.retest.edge if price_check.retest else None)
         detail.update(reason=risk.reason, stop_reference_3m=reference.close, risk_evidence=risk.evidence)
         if risk.plan is not None:
             detail['plan'] = asdict(risk.plan)
@@ -2419,20 +2488,23 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
             and now - timestamp(last_exit['at']) < cfg.cooldown_minutes * MINUTE):
         return no_trade('SAME_DIRECTION_POST_EXIT_COOLDOWN')
 
-    option_side = 'CE' if signal.side == 1 else 'PE'
     listed = {(row['instrument_type'], float(row['strike_price'])): row for row in contracts}
-    choices = []
-    for offset in (-signal.side, -2 * signal.side):
-        pair = reading.band.pairs.get(offset)
-        if pair is None:
-            continue
-        row = listed.get((option_side, pair.strike))
-        if row is not None:
-            choices.append((offset, pair, row))
+    choices = directional_contracts(reading.band, signal.side, listed)
     if not choices:
         return no_trade('DIRECTIONAL_OFFSETS_NOT_LISTED')
+    request_keys = [row['instrument_key'] for _, _, row in choices]
+    # Near the midpoint, request the adjacent ATM band's contracts as well.
+    # The final spot decides which offsets are eligible.
+    atm = reading.band.atm
+    displacement = reading.spot - atm
+    if abs(displacement) >= .35 * NIFTY_STRIKE_INTERVAL:
+        neighbor = reading.grid.index(atm) + (1 if displacement > 0 else -1)
+        if 0 <= neighbor < len(reading.grid):
+            band = StrikeBand.build(reading.grid, reading.grid[neighbor], reading.pairs)
+            if band is not None:
+                request_keys.extend(row['instrument_key'] for _, _, row in directional_contracts(band, signal.side, listed))
     try:
-        option_quotes = api.quotes([INDEX, *(row['instrument_key'] for _, _, row in choices)])
+        option_quotes = api.quotes([INDEX, *dict.fromkeys(request_keys)])
         now = clock()
         final_index = option_quotes.get(INDEX)
         final_spot = checked_quote(final_index, now, cfg.quote_max_age_seconds)
@@ -2444,7 +2516,8 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
         return no_trade('DECISION_WINDOW_EXPIRED_DURING_QUOTE_FETCH')
 
     final_reading = MarketReading.observe(final_spot, 'INDEX_QUOTE', contracts, window)
-    if final_reading.band is None or final_reading.band.atm != reading.band.atm:
+    if (final_reading.band is None
+            or abs(final_reading.band.atm - atm) > NIFTY_STRIKE_INTERVAL):
         return no_trade('ATM_CHANGED_BEFORE_EXECUTION')
     spot, quote_time = final_spot, final_quote_time
     final_checks, executable, _ = evaluate_setups(
@@ -2463,13 +2536,17 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
                                     entry_timing=final_check['entry_timing'])
     if 'retest' in final_check:
         result['entry_evidence']['retest'] = final_check['retest']
+    result['entry_evidence'].update(initial_atm=atm, final_atm=final_reading.band.atm)
 
     ranked = []
     result['contract_checks'] = []
+    choices = directional_contracts(final_reading.band, signal.side, listed)
+    if not choices:
+        return no_trade('DIRECTIONAL_OFFSETS_NOT_LISTED')
     for offset, pair, row in choices:
         key = row['instrument_key']
         try:
-            contract = live_contract(row, option_quotes.get(key), now, quote_time, reading.band, offset, cfg)
+            contract = live_contract(row, option_quotes.get(key), now, quote_time, final_reading.band, offset, cfg)
         except (DataError, KeyError, ValueError, TypeError) as exc:
             result['contract_checks'].append({'strike': pair.strike, 'reason': str(exc)})
             continue
@@ -2489,7 +2566,7 @@ def scan(state: dict, api, cfg: Config, clock_fn=None,
                 'side': contract['side'], 'strike': contract['strike'], 'expiry': contract['expiry'],
                 'instrument_key': key, 'opened_at': now.isoformat(), 'entry_spot': spot,
                 'entry_ask': contract['ask'], 'initial_stop': plan.stop,
-                'setup_level': signal.level, 'setup_invalidation': signal.invalidation,
+                'setup_level': signal.level, 'setup_invalidation': final_evidence['structural_invalidation'],
                 'target_checkpoints': final_evidence['intermediate_levels'],
                 'last_candle': bars[-1].start.isoformat(), 'scenario': signal.scenario,
                 't1_hit': False, 'remaining_pct': 100, 'contract': contract, **asdict(plan)}
@@ -2581,6 +2658,10 @@ def mail_content(event: dict) -> tuple[str, str]:
         f'T2 (underlying): {t2}',
         f'SL (underlying): {stop}',
     ]
+    touch = observation.get('target_touch_extreme')
+    if kind in ('T1', 'T2') and touch in ('high', 'low'):
+        trigger_spot = email_price(observation.get('target_touch_spot'), ',.4f')
+        fields.append(f'Target touch: {trigger_spot} (1-minute {touch})')
     if kind == 'T1' and details.get('old_stop') is not None and details.get('new_stop') is not None:
         previous = email_price(details['old_stop'], ',.4f')
         updated = email_price(details['new_stop'], ',.4f')
