@@ -32,8 +32,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '136.0.0'
-AUDIT_RELEASE = 'v136'
+VERSION = '136.1.0'
+AUDIT_RELEASE = 'v136_1'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1248,9 +1248,14 @@ MAX_ENTRY_CANDLE_LAG = MINUTE
 MAX_TRIGGER_AGE = DISPATCH_INTERVAL + MAX_ENTRY_CANDLE_LAG
 CANDLE_REFRESH_REQUEST_BUDGET = timedelta(seconds=16)
 OI_LEVEL_MATERIAL_CHANGE = 0.02
+EARLY_RETEST_OI_CHANGE = 0.019
 T1_SPOT_BAND = (45.0, 50.0)
 T2_SPOT_BAND = (80.0, 90.0)
 STRONG_MOVE = 15.0
+MIN_STOP_POINTS = 2.0
+MIN_STOP_ATR_FRACTION = 0.30
+CONTAINMENT_MINUTES = 18
+STOP_REENTRY_LOOKBACK = 15
 
 
 @dataclass(frozen=True)
@@ -1266,14 +1271,12 @@ class Config:
     max_state_history: int = 240
     record_inputs: bool = True
     arm_continuation_runner: bool = True
-    allow_atm_reversal: bool = True
     reversal_strike_stop: bool = False
 
     def __post_init__(self):
         flags = (
             'record_inputs',
             'arm_continuation_runner',
-            'allow_atm_reversal',
             'reversal_strike_stop',
         )
         integers = (
@@ -1324,13 +1327,16 @@ class OIPair:
         strong, weak = sorted(map(abs, changes), reverse=True)
         if strong >= OI_LEVEL_MATERIAL_CHANGE:
             return 'STANDARD_2_PERCENT'
-        if defended and strong >= 0.018 and weak >= 0.005:
-            return 'DEFENDED_RETEST_1_8_PERCENT'
+        if defended and strong >= EARLY_RETEST_OI_CHANGE and weak >= 0.005:
+            return 'DEFENDED_RETEST_1_9_PERCENT'
         return None
 
     @property
     def quiet(self) -> bool:
-        return self.changes is not None and max(map(abs, self.changes)) < 0.018
+        return (
+            self.changes is not None
+            and max(map(abs, self.changes)) < EARLY_RETEST_OI_CHANGE
+        )
 
     def score(self, side: int) -> float:
         if self.changes is None:
@@ -1430,6 +1436,30 @@ class Signal:
 
 
 @dataclass(frozen=True)
+class RangeEscape:
+    bounds: tuple[float, float]
+    signal: Signal
+    margin: float
+
+    def clear(self, value: float) -> bool:
+        return self.signal.side * (value - self.signal.trigger) > self.margin
+
+    def permits(self, signal: Signal, spot: float, close: float) -> bool:
+        if signal.side != self.signal.side or signal.at < self.signal.at:
+            return False
+        if self.clear(spot) and self.clear(close):
+            return True
+        # After a confirmed outer break, a fresh defended retest may
+        # deliberately come back to that same boundary.
+        return (
+            signal.defended
+            and signal.trigger == self.signal.trigger
+            and signal.side * (spot - signal.trigger) > 0
+            and signal.side * (close - signal.trigger) > 0
+        )
+
+
+@dataclass(frozen=True)
 class PriceContext:
     bars: list[Candle]
     threes: list[Candle]
@@ -1449,6 +1479,7 @@ class PriceContext:
     bounds: tuple[float, float] | None
     patterns: dict[int, Pattern]
     signals: list[Signal]
+    range_escape: RangeEscape | None = None
 
     @property
     def at(self) -> datetime:
@@ -1486,6 +1517,9 @@ class PriceContext:
             if self.broken_at
             else None,
             'range': self.bounds,
+            'range_escape': jsonable(asdict(self.range_escape))
+            if self.range_escape
+            else None,
             'move_3m': self.move,
             'acceleration_3m': self.acceleration,
             'atr_1m': self.atr,
@@ -1531,6 +1565,34 @@ def defended_range(bars: list[Candle], atr: float) -> tuple[float, float] | None
             for j in touches
         ):
             return None
+    return lower, upper
+
+
+def broader_containment(bars: list[Candle], atr: float) -> tuple[float, float] | None:
+    """Recognize an overlapping auction from completed bars even with single edge tests."""
+    if len(bars) != CONTAINMENT_MINUTES:
+        return None
+    lower = min(bar.low for bar in bars)
+    upper = max(bar.high for bar in bars)
+    width = upper - lower
+    if not max(8.0, 1.2 * atr) <= width <= 4.2 * atr:
+        return None
+    closes = [bar.close for bar in bars]
+    displacement = abs(closes[-1] - closes[0])
+    travel = sum(abs(new - old) for old, new in zip(closes, closes[1:]))
+    if displacement > 0.30 * width or displacement > 0.24 * travel:
+        return None
+    # Require repeated traversals of the middle zone. Closes oscillating
+    # inside a small band around the midpoint do not count as crossings.
+    middle = (lower + upper) / 2
+    deadband = 0.08 * width
+    sides = [
+        1 if close > middle else -1
+        for close in closes
+        if abs(close - middle) >= deadband
+    ]
+    if sum(old != new for old, new in zip(sides, sides[1:])) < 3:
+        return None
     return lower, upper
 
 
@@ -1596,6 +1658,19 @@ def accepted_level(bars: list[Candle], side: int, level: float) -> bool:
     return len(bars) >= 2 and all(side * (bar.close - level) > 0 for bar in bars[-2:])
 
 
+def held_boundary(
+    bars: list[Candle], threes: list[Candle], side: int, boundary: float, margin: float
+) -> bool:
+    if len(bars) < 2 or not threes:
+        return False
+    level = boundary + side * margin
+    return (
+        bar_end(threes[-1], 3) >= bars[-1].start
+        and side * (threes[-1].close - level) > 0
+        and accepted_level(bars, side, level)
+    )
+
+
 def analyze_price(
     bars: list[Candle], prior_ten: list[Candle], session_open: datetime
 ) -> PriceContext:
@@ -1608,6 +1683,7 @@ def analyze_price(
     protected = broken_level = None
     broken_at = None
     bounds = None
+    range_escape = None
     signals: dict[str, Signal] = {}
     patterns: dict[int, Pattern] = {}
     atr = 3.0
@@ -1623,15 +1699,42 @@ def analyze_price(
         atr3 = volatility(completed, minimum=2.5)
         prior = prefix[-2] if i else None
         range_break = None
+        margin = max(1.0, 0.25 * atr)
 
+        if range_escape is not None:
+            escaped = range_escape.signal
+            if at - escaped.at > 2 * DISPATCH_INTERVAL:
+                range_escape = None
+            elif escaped.side * (bar.close - escaped.trigger) <= 0:
+                bounds = range_escape.bounds
+                range_escape = None
         if bounds is not None:
             for side, level in ((-1, bounds[0]), (1, bounds[1])):
-                if accepted_level(prefix, side, level):
+                if held_boundary(prefix, completed, side, level, margin):
+                    # The competing range may have been established just
+                    # before this close rolled its first test out of view.
+                    new_bounds = defended_range(prefix[-9:], atr) or defended_range(
+                        prefix[-10:-1], atr
+                    )
+                    if (
+                        new_bounds is not None
+                        and new_bounds[1] - new_bounds[0] < bounds[1] - bounds[0]
+                        and new_bounds[0] < bounds[1]
+                        and new_bounds[1] > bounds[0]
+                        and new_bounds[0] <= bar.close <= new_bounds[1]
+                    ):
+                        # A separately defended, tighter range can straddle
+                        # the old boundary. Its own outer edges still govern.
+                        bounds = new_bounds
+                        break
                     range_break = Signal(side, 'RANGE_BREAK_HOLD', at, level, level)
+                    range_escape = RangeEscape(bounds, range_break, margin)
                     bounds = None
                     break
-        elif i >= 8:
-            bounds = defended_range(prefix[-9:], atr)
+        elif range_escape is None:
+            bounds = broader_containment(prefix[-CONTAINMENT_MINUTES:], atr)
+            if bounds is None:
+                bounds = defended_range(prefix[-9:], atr)
 
         if (
             trend
@@ -1795,6 +1898,7 @@ def analyze_price(
         bounds,
         patterns,
         list(signals.values()),
+        range_escape,
     )
 
 
@@ -1844,16 +1948,20 @@ def risk_plan(
     else:
         return None, 'COMPLETED_3M_STOP_UNAVAILABLE', {}
     risk = side * (spot - stop)
+    minimum_risk = max(MIN_STOP_POINTS, MIN_STOP_ATR_FRACTION * ctx.atr)
     evidence = {
         'stop': stop,
         'stop_at': stop_time.isoformat(),
         'stop_source': stop_source,
         'risk_points': round(risk, 4),
+        'minimum_stop_clearance': round(minimum_risk, 4),
         'target_anchor': spot,
         'minimum_reward_risk': cfg.min_reward_risk,
     }
     if risk <= 0:
         return None, 'STOP_WRONG_SIDE_OF_LIVE_SPOT', evidence
+    if risk + 1e-9 < minimum_risk:
+        return None, 'STOP_TOO_CLOSE_TO_LIVE_SPOT', evidence
 
     levels = market_targets(ctx, window, spot, side)
 
@@ -1927,6 +2035,7 @@ def evaluate_setups(
     for signal in sorted(
         ctx.signals,
         key=lambda s: (
+            s.kind != 'RANGE_BREAK_HOLD',
             not bool(s.reversal),
             not s.defended,
             -s.at.timestamp(),
@@ -1956,6 +2065,10 @@ def evaluate_setups(
             detail['reason'] = 'TRIGGER_OUTSIDE_DISPATCH_WINDOW'
         elif ctx.bounds is not None:
             detail['reason'] = 'INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD'
+        elif ctx.range_escape is not None and not ctx.range_escape.permits(
+            signal, spot, ctx.bars[-1].close
+        ):
+            detail['reason'] = 'OUTER_RANGE_BREAK_NOT_CONFIRMED_FOR_TRIGGER'
         elif signal.reversal and not any(
             (
                 ctx.broken_side == -side
@@ -1972,8 +2085,8 @@ def evaluate_setups(
             )
         ):
             detail['reason'] = 'OPPOSING_PROTECTED_STRUCTURE_INTACT'
-        elif signal.kind == 'RANGE_BREAK_HOLD' and not accepted_level(
-            ctx.bars, side, signal.trigger
+        elif signal.kind == 'RANGE_BREAK_HOLD' and not (
+            ctx.range_escape is not None and signal == ctx.range_escape.signal
         ):
             detail['reason'] = 'RANGE_BREAK_NO_LONGER_HELD'
         elif (
@@ -2001,15 +2114,12 @@ def evaluate_setups(
 
 
 def directional_contracts(
-    band: StrikeBand, setup: Setup, listed: dict, cfg: Config
+    band: StrikeBand, setup: Setup, listed: dict
 ) -> list[tuple[int, OIPair, dict, str]]:
     signal = setup.signal
     side = signal.side
-    offsets = [-side, -2 * side]
-    if signal.reversal and cfg.allow_atm_reversal:
-        offsets.append(0)
     choices = []
-    for offset in offsets:
+    for offset in (-side, -2 * side):
         pair = band.pairs.get(offset)
         if pair is None:
             continue
@@ -2018,6 +2128,54 @@ def directional_contracts(
         if row is not None and rule:
             choices.append((offset, pair, row, rule))
     return choices
+
+
+def post_exit_entry_check(
+    signal: Signal, ctx: PriceContext, spot: float, last_exit: dict, history: list[dict]
+) -> dict:
+    """Require a new outer break for a same-side entry following a stop."""
+    exited = timestamp(last_exit['at'])
+    check = {'trigger': signal.identity, 'previous_exit_at': exited.isoformat()}
+    if signal.at <= exited:
+        return dict(check, reason='REENTRY_REQUIRES_NEW_POST_EXIT_TRIGGER')
+    direction = 'BULLISH' if signal.side == 1 else 'BEARISH'
+    if exited.date() != ctx.at.date() or last_exit.get('direction') != direction:
+        return dict(check, reason='QUALIFIED')
+    reason = last_exit.get('reason')
+    if reason is None:
+        # Existing v136 state stores the reason on the closed position.
+        reason = next(
+            (
+                row.get('exit_reason')
+                for row in reversed(history)
+                if row.get('id') == last_exit.get('id')
+            ),
+            None,
+        )
+    if reason not in ('STRUCTURAL_SL', None):
+        return dict(check, reason='QUALIFIED')
+
+    prior = [bar for bar in ctx.bars if bar_end(bar) <= exited][-STOP_REENTRY_LOOKBACK:]
+    if len(prior) < 6:
+        return dict(check, reason='POST_STOP_STRUCTURE_UNAVAILABLE')
+    side = signal.side
+    boundary = (
+        max(bar.high for bar in prior) if side == 1 else min(bar.low for bar in prior)
+    )
+    margin = max(1.0, 0.25 * volatility(prior, minimum=2.5))
+    post = [bar for bar in ctx.bars if bar.start >= exited]
+    threes = [bar for bar in ctx.threes if bar.start >= exited]
+    check.update(outer_boundary=boundary, clearance_points=round(margin, 4))
+    # A continuation trigger comes from the preceding swing and may sit just
+    # inside the boundary. It must still belong to the new break, not the
+    # earlier leg. An older range boundary alone cannot authorize re-entry.
+    if (
+        not held_boundary(post, threes, side, boundary, margin)
+        or side * (spot - boundary) <= margin
+        or side * (signal.trigger - boundary) < -margin
+    ):
+        return dict(check, reason='POST_STOP_OUTER_BREAK_AND_HOLD_REQUIRED')
+    return dict(check, reason='QUALIFIED')
 
 
 # Reference position management. Candle observations and live quotes have
@@ -2382,6 +2540,7 @@ def scan(
                 'at': closed['closed_at'],
                 'direction': closed['direction'],
                 'id': closed['id'],
+                'reason': closed['exit_reason'],
             }
         state['position'] = position
         result['position_locked'] = position is not None
@@ -2700,10 +2859,18 @@ def scan(
         )
     last_exit = state.get('last_exit')
     if last_exit:
-        exited = timestamp(last_exit['at'])
-        setups = [setup for setup in setups if setup.signal.at > exited]
+        checks = [
+            post_exit_entry_check(setup.signal, ctx, spot, last_exit, state['history'])
+            for setup in setups
+        ]
+        result['reentry_checks'] = checks
+        setups = [
+            setup
+            for setup, check in zip(setups, checks)
+            if check['reason'] == 'QUALIFIED'
+        ]
         if not setups:
-            return no_trade('REENTRY_REQUIRES_NEW_POST_EXIT_TRIGGER')
+            return no_trade(checks[0]['reason'])
     if len({setup.signal.side for setup in setups}) != 1:
         return no_trade('CONFLICTING_QUALIFIED_DIRECTIONS')
 
@@ -2720,9 +2887,7 @@ def scan(
         for setup in setups:
             request_keys.extend(
                 row['instrument_key']
-                for _, _, row, _ in directional_contracts(
-                    candidate_band, setup, listed, cfg
-                )
+                for _, _, row, _ in directional_contracts(candidate_band, setup, listed)
             )
     if not request_keys:
         return no_trade('NO_DIRECTIONAL_OI_AT_ELIGIBLE_OFFSETS')
@@ -2761,14 +2926,27 @@ def scan(
     final_setups = [setup for setup in final_setups if setup.signal.identity in wanted]
     if not final_setups:
         return no_trade('FINAL_LIVE_PRICE_INVALIDATES_SETUP')
+    if last_exit:
+        checks = [
+            post_exit_entry_check(
+                setup.signal, ctx, final_spot, last_exit, state['history']
+            )
+            for setup in final_setups
+        ]
+        result['final_reentry_checks'] = checks
+        final_setups = [
+            setup
+            for setup, check in zip(final_setups, checks)
+            if check['reason'] == 'QUALIFIED'
+        ]
+        if not final_setups:
+            return no_trade(checks[0]['reason'])
 
     result['contract_checks'] = []
     for setup in final_setups:
         signal, plan = setup.signal, setup.plan
         ranked = []
-        for offset, pair, row, rule in directional_contracts(
-            final_band, setup, listed, cfg
-        ):
+        for offset, pair, row, rule in directional_contracts(final_band, setup, listed):
             key = row['instrument_key']
             check = {
                 'strike': pair.strike,
@@ -3087,6 +3265,7 @@ def environment_config() -> Config:
         'max_stop_atr',
         'max_unretested_leg_atr',
         'cooldown_minutes',
+        'allow_atm_reversal',
     ):
         raw.pop(legacy, None)
     # v133 stored these values as defaults in some deployed configurations.
