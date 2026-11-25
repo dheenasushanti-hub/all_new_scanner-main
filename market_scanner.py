@@ -32,8 +32,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '137.0.0'
-AUDIT_RELEASE = 'v137'
+VERSION = '137.1.0'
+AUDIT_RELEASE = 'v137_1'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1467,6 +1467,12 @@ class TradingRange:
 
 
 @dataclass(frozen=True)
+class RangeBreak:
+    region: TradingRange
+    setup: EntrySetup
+
+
+@dataclass(frozen=True)
 class Reversal:
     side: int
     neckline: float
@@ -1507,7 +1513,7 @@ class PriceContext:
     setup: EntrySetup | None
     move: float | None
     acceleration: float | None
-    released_range: TradingRange | None = None
+    released_range: RangeBreak | None = None
 
     @property
     def through(self) -> datetime:
@@ -1516,18 +1522,16 @@ class PriceContext:
     def live_range(self, spot: float | None) -> TradingRange | None:
         if self.trading_range:
             return self.trading_range
-        if (
-            self.released_range
-            and self.setup
-            and spot is not None
-            and not passed(
-                spot,
-                self.setup.trigger,
-                self.setup.side,
-                self.setup.break_margin,
+        if self.released_range and spot is not None:
+            breakout = self.released_range.setup
+            defended = (
+                self.setup
+                and self.setup.identity == breakout.identity
+                and self.setup.defended_at
             )
-        ):
-            return self.released_range
+            margin = 0.0 if defended else breakout.break_margin
+            if not passed(spot, breakout.trigger, breakout.side, margin):
+                return self.released_range.region
         return None
 
     def regime(self, band: StrikeBand | None, spot: float | None = None) -> str:
@@ -1672,7 +1676,8 @@ class SessionStructure:
         self.leg: DirectionalLeg | None = None
         self.transition: StructureTransition | None = None
         self.range: TradingRange | None = None
-        self.released_range: TradingRange | None = None
+        self.released_range: RangeBreak | None = None
+        self.pending_range_retest: EntrySetup | None = None
         self.setup: EntrySetup | None = None
         self.pivots: dict[int, list[Swing]] = {1: [], -1: []}
         self.swings3: dict[int, list[Swing]] = {1: [], -1: []}
@@ -1689,6 +1694,7 @@ class SessionStructure:
         atr3: float,
         *,
         break_margin: float = 0.0,
+        defended_at: datetime | None = None,
     ) -> None:
         now = bar_end(bar)
         self.trend, self.protected = side, stop
@@ -1708,6 +1714,7 @@ class SessionStructure:
             min(36.0, max(15.0, 1.10 * atr)),
             min(115.0, max(60.0 if kind == 'REVERSAL' else 48.0, 1.65 * atr3)),
             break_margin=break_margin,
+            defended_at=defended_at,
         )
 
     def bootstrap(
@@ -1754,18 +1761,22 @@ class SessionStructure:
         bar = bars[-1]
         now = bar_end(bar)
         released = self.released_range
-        if released and self.setup and self.setup.kind == 'RANGE_BREAK':
-            if not passed(bar.close, self.setup.trigger, self.setup.side):
-                self.range, self.released_range = released, None
-                self.setup = None
-            elif now > self.setup.expires_at:
+        if released:
+            breakout = released.setup
+            if now > breakout.expires_at:
                 self.released_range = None
+            elif not passed(bar.close, breakout.trigger, breakout.side):
+                self.range, self.released_range = released.region, None
+                self.pending_range_retest = None
+                if self.setup and self.setup.identity == breakout.identity:
+                    self.setup = None
         if self.range is None and self.released_range is None:
             self.range = detect_range(bars, threes, last_ten, atr)
         region = self.range
         if region is None:
             return False
-        self.setup = None
+        if self.setup and self.setup.kind != 'REVERSAL':
+            self.setup = None
         if (
             len(threes) < 2
             or bar_end(threes[-1], 3) != now
@@ -1804,10 +1815,59 @@ class SessionStructure:
                 atr3,
                 break_margin=region.margin,
             )
-            self.range, self.released_range = None, region
-            self.transition = None
+            assert self.setup is not None
+            self.range, self.released_range = None, RangeBreak(region, self.setup)
+            self.pending_range_retest = self.setup
+            if not (
+                self.transition
+                and self.transition.initial_confirmed
+                and side == -self.transition.previous_side
+            ):
+                self.transition = None
             return True
         return True
+
+    def advance_range_retest(self, bars: list[Candle], atr: float, atr3: float) -> None:
+        breakout = self.pending_range_retest
+        if breakout is None:
+            return
+        now = bar_end(bars[-1])
+        side, level = breakout.side, breakout.trigger
+        if (
+            side != self.trend
+            or now > breakout.confirmed_at + EXTREME_CONFIRMATION_AGE
+            or held_break(bars, -side, level)
+        ):
+            self.pending_range_retest = None
+            return
+        if now <= breakout.expires_at or (
+            self.setup and self.setup.confirmed_at == now
+        ):
+            return
+        stop = confirmed_swing(bars, side, 1)
+        if not stop or abs(stop.price - level) > max(1.0, 0.65 * atr):
+            return
+        pivot = bars[-2]
+        trigger = favorable_edge(pivot, side)
+        if not (
+            self.protected
+            and passed(stop.price, self.protected.price, side)
+            and held_break(bars, side, level)
+            and passed(bars[-1].close, trigger, side)
+        ):
+            return
+        self.start_leg(
+            bars[-1],
+            side,
+            'RANGE_RETEST',
+            trigger,
+            stop,
+            level,
+            atr,
+            atr3,
+            defended_at=now,
+        )
+        self.pending_range_retest = None
 
     def advance_transition(
         self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
@@ -1924,6 +1984,16 @@ class SessionStructure:
             if opening
             else max(12.0, 0.85 * atr, 0.85 * atr3)
         )
+        # A compact pullback in a persistent trend needs its own completed
+        # 3-minute countertrend move. A new favorable wick cannot certify it.
+        compact = (
+            not opening
+            and len(threes) >= 2
+            and bar_end(threes[-1], 3) == now
+            and passed(threes[-1].close, threes[-2].close, -side, max(6.0, 0.20 * atr3))
+        )
+        if compact:
+            distance = max(9.0, 0.60 * atr, 0.35 * atr3)
         if side * (leg.extreme.price - bar.close) >= distance:
             leg.pullback = Swing(opposite, bar.start, now)
 
@@ -1946,9 +2016,6 @@ class SessionStructure:
                 if pivot3:
                     self.swings3[side].append(pivot3)
 
-        if self.advance_range(bars, threes, last_ten, atr, atr3):
-            return
-
         if (
             self.trend
             and self.protected
@@ -1957,12 +2024,18 @@ class SessionStructure:
             self.transition = StructureTransition(self.trend, self.protected, now)
             self.trend, self.protected, self.leg, self.setup = 0, None, None, None
 
-        if self.transition:
+        processing_transition = self.transition is not None
+        if processing_transition:
             self.advance_transition(bars, threes, atr, atr3)
-        elif self.trend:
-            self.advance_leg(bar, threes, atr, atr3)
-        else:
-            self.bootstrap(bar, threes, atr, atr3)
+
+        if self.advance_range(bars, threes, last_ten, atr, atr3):
+            return
+        if not processing_transition:
+            if self.trend:
+                self.advance_leg(bar, threes, atr, atr3)
+            else:
+                self.bootstrap(bar, threes, atr, atr3)
+        self.advance_range_retest(bars, atr, atr3)
 
         # A confirmed higher low/lower high can tighten the trend boundary
         # without making a new entry setup or moving an active position's stop.
@@ -2185,6 +2258,8 @@ def assess_entry(
 
     if ctx.trading_range:
         return blocked('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD', 'INVALIDATED')
+    if ctx.live_range(spot):
+        return blocked('PRICE_BACK_BEHIND_TRIGGER')
     if risk <= 0 or any(
         not passed(protective_edge(b, side), setup.stop.price, side)
         for b in ctx.bars
