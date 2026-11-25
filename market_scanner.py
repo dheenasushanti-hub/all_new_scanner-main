@@ -4,7 +4,7 @@
 Production entry points implement the existing Cloudflare/GitHub Actions and
 state/outbox interfaces. Structure, paired OI, contract quotes and position
 management are independent decision stages. Historical market data is never
-substituted for a live quote. Run regressions with test_market_scanner.py.
+substituted for a live quote. Regression tests run separately from the scheduled scanner.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, date, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -32,8 +32,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '136.1.0'
-AUDIT_RELEASE = 'v136_1'
+VERSION = '137.0.0'
+AUDIT_RELEASE = 'v137'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1241,19 +1241,17 @@ def prior_context(engine: dict, api, now: datetime) -> list[Candle]:
     return parse_candles(engine['prior_ten'], now) if engine['prior_ten'] else []
 
 
-# Decision policy. Infrastructure and the persisted schema remain independent.
 MINUTE = timedelta(minutes=1)
 DISPATCH_INTERVAL = 3 * MINUTE
 MAX_ENTRY_CANDLE_LAG = MINUTE
 MAX_TRIGGER_AGE = DISPATCH_INTERVAL + MAX_ENTRY_CANDLE_LAG
-CANDLE_REFRESH_REQUEST_BUDGET = timedelta(seconds=16)
 OI_LEVEL_MATERIAL_CHANGE = 0.02
 EARLY_RETEST_OI_CHANGE = 0.019
 T1_SPOT_BAND = (45.0, 50.0)
 T2_SPOT_BAND = (80.0, 90.0)
 STRONG_MOVE = 15.0
-MIN_STOP_POINTS = 2.0
-MIN_STOP_ATR_FRACTION = 0.30
+MIN_STOP_POINTS = 3.0
+MIN_STOP_ATR_FRACTION = 0.45
 CONTAINMENT_MINUTES = 18
 STOP_REENTRY_LOOKBACK = 15
 
@@ -1264,20 +1262,18 @@ class Config:
     feed_grace_seconds: float = 2.0
     quote_max_age_seconds: int = 35
     quote_max_skew_seconds: int = 12
-    max_chase_atr: float = 0.75
     min_reward_risk: float = 0.0
     max_spread_percent: float = 2.0
     min_depth_lots: float = 1.0
     max_state_history: int = 240
     record_inputs: bool = True
     arm_continuation_runner: bool = True
-    reversal_strike_stop: bool = False
+    max_initial_risk_points: float = 60.0
 
     def __post_init__(self):
         flags = (
             'record_inputs',
             'arm_continuation_runner',
-            'reversal_strike_stop',
         )
         integers = (
             'oi_jitter_seconds',
@@ -1405,58 +1401,95 @@ class StrikeBand:
         }
 
 
+# Market structure, setup lifecycle and planning.
+EXTREME_CONFIRMATION_AGE = 18 * MINUTE
+OPENING_PHASE = 18 * MINUTE
+
+
+def favorable_edge(bar: Candle, side: int) -> float:
+    return bar.high if side == 1 else bar.low
+
+
+def protective_edge(bar: Candle, side: int) -> float:
+    return bar.low if side == 1 else bar.high
+
+
+def passed(value: float, boundary: float, side: int, margin: float = 0.0) -> bool:
+    return side * (value - boundary) > margin
+
+
+def confirmed_swing(bars: list[Candle], side: int, duration: int) -> Swing | None:
+    if len(bars) < 3:
+        return None
+    left, center, right = bars[-3:]
+    price = protective_edge(center, side)
+    if (
+        right.start - center.start == center.start - left.start == duration * MINUTE
+        and side * (protective_edge(left, side) - price) > 0
+        and side * (protective_edge(right, side) - price) > 0
+    ):
+        return Swing(price, center.start, bar_end(right, duration))
+    return None
+
+
 @dataclass(frozen=True)
-class Pattern:
-    side: int
-    first: Swing
-    second: Swing
-    neckline: float
-    confirmed_at: datetime
-
-    @property
-    def stop(self) -> float:
-        return self.side * min(
-            self.side * self.first.price, self.side * self.second.price
-        )
-
-
-@dataclass(frozen=True)
-class Signal:
+class EntrySetup:
     side: int
     kind: str
-    at: datetime
     trigger: float
+    stop: Swing
     oi_level: float
-    defended: bool = False
-    reversal: Pattern | None = None
+    confirmed_at: datetime
+    expires_at: datetime
+    leg_anchor: float
+    leg_started_at: datetime
+    trigger_limit: float
+    leg_limit: float
+    defended_at: datetime | None = None
+    break_margin: float = 0.0
 
     @property
     def identity(self) -> str:
-        return f'{self.side}:{self.kind}:{self.at.isoformat()}:{self.trigger:.4f}'
+        # A defended retest updates evidence for the original opportunity.
+        raw = f'{self.side}|{self.kind}|{self.leg_started_at.isoformat()}|{self.confirmed_at.isoformat()}'
+        return hashlib.sha256(raw.encode()).hexdigest()[:22]
 
 
 @dataclass(frozen=True)
-class RangeEscape:
-    bounds: tuple[float, float]
-    signal: Signal
+class TradingRange:
+    low: float
+    high: float
+    established_at: datetime
     margin: float
 
-    def clear(self, value: float) -> bool:
-        return self.signal.side * (value - self.signal.trigger) > self.margin
+    def edge(self, side: int) -> float:
+        return self.high if side == 1 else self.low
 
-    def permits(self, signal: Signal, spot: float, close: float) -> bool:
-        if signal.side != self.signal.side or signal.at < self.signal.at:
-            return False
-        if self.clear(spot) and self.clear(close):
-            return True
-        # After a confirmed outer break, a fresh defended retest may
-        # deliberately come back to that same boundary.
-        return (
-            signal.defended
-            and signal.trigger == self.signal.trigger
-            and signal.side * (spot - signal.trigger) > 0
-            and signal.side * (close - signal.trigger) > 0
-        )
+
+@dataclass(frozen=True)
+class Reversal:
+    side: int
+    neckline: float
+    first: Swing
+    second: Swing
+    stop: Swing
+
+
+@dataclass
+class StructureTransition:
+    previous_side: int
+    protection: Swing
+    started_at: datetime
+    pattern: Reversal | None = None
+    expansion_level: float | None = None
+    initial_confirmed: bool = False
+
+
+@dataclass
+class DirectionalLeg:
+    side: int
+    extreme: Swing
+    pullback: Swing | None = None
 
 
 @dataclass(frozen=True)
@@ -1467,715 +1500,805 @@ class PriceContext:
     prior_ten: list[Candle]
     atr: float
     atr3: float
-    atr10: float
-    direction: int
+    trend: int
+    protected: Swing | None
+    trading_range: TradingRange | None
+    transition: StructureTransition | None
+    setup: EntrySetup | None
     move: float | None
     acceleration: float | None
-    trend: int
-    protected: float | None
-    broken_side: int
-    broken_level: float | None
-    broken_at: datetime | None
-    bounds: tuple[float, float] | None
-    patterns: dict[int, Pattern]
-    signals: list[Signal]
-    range_escape: RangeEscape | None = None
+    released_range: TradingRange | None = None
 
     @property
-    def at(self) -> datetime:
+    def through(self) -> datetime:
         return bar_end(self.bars[-1])
 
-    def public(self, band: StrikeBand | None) -> dict:
-        quiet = band is not None and all(
-            k in band.pairs and band.pairs[k].quiet for k in (-2, -1, 1, 2)
-        )
-        weak = (
-            self.move is not None
-            and self.acceleration is not None
-            and abs(self.move) < STRONG_MOVE
-            and abs(self.acceleration) < STRONG_MOVE
-        )
-        state = 'MIXED'
-        if self.bounds is not None:
-            if (
-                quiet
-                and weak
-                and self.bounds[1] - self.bounds[0] <= 2 * max(self.atr3, self.atr10)
+    def live_range(self, spot: float | None) -> TradingRange | None:
+        if self.trading_range:
+            return self.trading_range
+        if (
+            self.released_range
+            and self.setup
+            and spot is not None
+            and not passed(
+                spot,
+                self.setup.trigger,
+                self.setup.side,
+                self.setup.break_margin,
+            )
+        ):
+            return self.released_range
+        return None
+
+    def regime(self, band: StrikeBand | None, spot: float | None = None) -> str:
+        if self.live_range(spot):
+            nearby = [band.pairs.get(k) for k in (-2, -1, 1, 2)] if band else []
+            if not nearby or any(
+                pair is None or pair.changes is None for pair in nearby
             ):
-                state = 'SIDEWAYS'
-        elif self.broken_side and -self.broken_side in self.patterns:
-            state = 'BULLISH_REVERSAL' if self.broken_side == -1 else 'BEARISH_REVERSAL'
-        elif self.direction and self.direction == self.trend:
-            state = 'CONTINUOUS_BULLISH' if self.trend == 1 else 'CONTINUOUS_BEARISH'
+                return 'RANGE_OI_UNAVAILABLE'
+            quiet = all(pair.quiet for pair in nearby)
+            weak = (
+                self.move is not None
+                and self.acceleration is not None
+                and max(abs(self.move), abs(self.acceleration)) < STRONG_MOVE
+            )
+            return 'SIDEWAYS' if quiet and weak else 'MIXED_RANGE'
+        if self.transition:
+            side = self.transition.previous_side
+            if self.transition.initial_confirmed:
+                return 'BULLISH_TO_BEARISH' if side == 1 else 'BEARISH_TO_BULLISH'
+            return 'TRANSITION_FROM_BULLISH' if side == 1 else 'TRANSITION_FROM_BEARISH'
+        return {1: 'CONTINUOUS_BULLISH', -1: 'CONTINUOUS_BEARISH', 0: 'UNCLASSIFIED'}[
+            self.trend
+        ]
+
+    def reversal_watch(self) -> dict | None:
+        if (
+            not self.trend
+            or self.transition
+            or not self.protected
+            or len(self.bars) < 3
+        ):
+            return None
+        side = -self.trend
+        test = min(self.bars[-12:-1], key=lambda b: side * protective_edge(b, side))
+        level = protective_edge(test, side)
+        if not passed(
+            self.bars[-1].close,
+            level,
+            side,
+            max(12.0, 0.90 * self.atr, 0.55 * self.atr3),
+        ):
+            return None
         return {
-            'state': state,
-            'through': self.at.isoformat(),
-            'trend': self.trend,
-            'protected': self.protected,
-            'broken_level': self.broken_level,
-            'break_confirmed_at': self.broken_at.isoformat()
-            if self.broken_at
-            else None,
-            'range': self.bounds,
-            'range_escape': jsonable(asdict(self.range_escape))
-            if self.range_escape
-            else None,
-            'move_3m': self.move,
-            'acceleration_3m': self.acceleration,
-            'atr_1m': self.atr,
-            'atr_3m': self.atr3,
-            'atr_10m': self.atr10,
-            'reversal_patterns': [jsonable(asdict(p)) for p in self.patterns.values()],
+            'side': side,
+            'test': level,
+            'test_at': test.start.isoformat(),
+            'protected_level': self.protected.price,
+            'status': 'PROTECTED_STRUCTURE_INTACT',
         }
 
 
-def three_direction(threes: list[Candle]) -> int:
-    if len(threes) < 2 or threes[-1].start - threes[-2].start != DISPATCH_INTERVAL:
-        return 0
-    first, last = threes[-2:]
-    if last.high < first.high and last.low < first.low and last.close < first.close:
-        return -1
-    if last.high > first.high and last.low > first.low and last.close > first.close:
-        return 1
-    return 0
+def detect_range(
+    bars: list[Candle],
+    threes: list[Candle],
+    last_ten: Candle | None,
+    atr: float,
+) -> TradingRange | None:
+    atr3 = volatility(threes, minimum=2.5)
+    for size in (CONTAINMENT_MINUTES, CONTAINMENT_MINUTES // 2):
+        if len(bars) < size:
+            continue
+        group = bars[-size:]
+        low = min(b.low for b in group)
+        high = max(b.high for b in group)
+        width = high - low
+        if not max(8.0, atr * 0.8) <= width <= min(4.2 * atr, 2.2 * atr3):
+            continue
+        closes = [b.close for b in group]
+        displacement = abs(closes[-1] - closes[0])
+        travel = sum(abs(b - a) for a, b in zip(closes, closes[1:]))
+        if displacement > min(0.33 * width, 0.30 * travel):
+            continue
+        mid = (high + low) / 2
+        sides = [x > mid for x in closes if abs(x - mid) >= 0.07 * width]
+        if sum(a != b for a, b in zip(sides, sides[1:])) >= 3:
+            if last_ten and last_ten.start >= group[0].start - 3 * MINUTE:
+                outer_low, outer_high = min(low, last_ten.low), max(high, last_ten.high)
+                if (
+                    outer_high - outer_low <= min(1.25 * width, 2.2 * atr3)
+                    and low <= last_ten.close <= high
+                ):
+                    low, high = outer_low, outer_high
+            return TradingRange(low, high, bar_end(group[-1]), max(1.0, 0.25 * atr))
+    return None
 
 
-def defended_range(bars: list[Candle], atr: float) -> tuple[float, float] | None:
-    if len(bars) != 9:
-        return None
-    lower = min(bar.low for bar in bars)
-    upper = max(bar.high for bar in bars)
-    width = upper - lower
-    if not max(8.0, 1.2 * atr) <= width <= 3.8 * atr:
-        return None
-    if abs(bars[-1].close - bars[0].close) > 0.55 * width:
-        return None
-    middle = (lower + upper) / 2
-    edge_distance = max(1.0, 0.25 * atr)
-    for side, level in ((1, lower), (-1, upper)):
-        touches = [
-            i
-            for i, b in enumerate(bars)
-            if abs((b.low if side == 1 else b.high) - level) <= edge_distance
-        ]
-        if not any(
-            j - i >= 2
-            and any(side * (bar.close - middle) >= 0 for bar in bars[i + 1 : j])
-            for i in touches
-            for j in touches
-        ):
-            return None
-    return lower, upper
-
-
-def broader_containment(bars: list[Candle], atr: float) -> tuple[float, float] | None:
-    """Recognize an overlapping auction from completed bars even with single edge tests."""
-    if len(bars) != CONTAINMENT_MINUTES:
-        return None
-    lower = min(bar.low for bar in bars)
-    upper = max(bar.high for bar in bars)
-    width = upper - lower
-    if not max(8.0, 1.2 * atr) <= width <= 4.2 * atr:
-        return None
-    closes = [bar.close for bar in bars]
-    displacement = abs(closes[-1] - closes[0])
-    travel = sum(abs(new - old) for old, new in zip(closes, closes[1:]))
-    if displacement > 0.30 * width or displacement > 0.24 * travel:
-        return None
-    # Require repeated traversals of the middle zone. Closes oscillating
-    # inside a small band around the midpoint do not count as crossings.
-    middle = (lower + upper) / 2
-    deadband = 0.08 * width
-    sides = [
-        1 if close > middle else -1
-        for close in closes
-        if abs(close - middle) >= deadband
-    ]
-    if sum(old != new for old, new in zip(sides, sides[1:])) < 3:
-        return None
-    return lower, upper
-
-
-def local_patterns(bars: list[Candle], atr: float, side: int) -> list[Pattern]:
-    """Two closed tests with an intact zone and an intervening closed reaction."""
-    tests = swings(bars, side, left=1)
-    tolerance = min(15.0, max(3.0, 0.65 * atr))
-    position = {b.start: i for i, b in enumerate(bars)}
-    patterns = []
-    for j, second in enumerate(tests):
-        second_index = position[second.at]
-        candidates = []
-        for first in reversed(tests[:j]):
-            between = bars[position[first.at] + 1 : second_index]
-            extremes = [side * (bar.low if side == 1 else bar.high) for bar in between]
-            if not between or abs(first.price - second.price) > tolerance:
-                continue
-            if (
-                min(extremes)
-                < min(side * first.price, side * second.price) - 0.25 * tolerance
-            ):
-                continue
-            inner = max(side * (bar.high if side == 1 else bar.low) for bar in between)
-            if inner - max(side * first.price, side * second.price) < max(
-                8.0, 0.50 * atr
-            ):
-                continue
-            if max(side * (bar.close - first.price) for bar in between) < max(
-                3.0, 0.28 * atr
-            ):
-                continue
-            stop = min(side * first.price, side * second.price)
-            for bar in bars[second_index:]:
-                edge = bar.low if side == 1 else bar.high
-                if side * edge < stop:
-                    break
-                if side * bar.close > inner:
-                    candidates.append(
-                        Pattern(
-                            side,
-                            first,
-                            second,
-                            side * inner,
-                            max(bar_end(bar), second.known_at),
-                        )
-                    )
-                    break
-        if candidates:
-            patterns.append(
-                min(
-                    candidates,
-                    key=lambda pattern: (
-                        side * pattern.stop,
-                        -side * pattern.neckline,
-                        pattern.confirmed_at,
-                    ),
-                )
-            )
-    return patterns
-
-
-def accepted_level(bars: list[Candle], side: int, level: float) -> bool:
-    return len(bars) >= 2 and all(side * (bar.close - level) > 0 for bar in bars[-2:])
-
-
-def held_boundary(
-    bars: list[Candle], threes: list[Candle], side: int, boundary: float, margin: float
+def held_break(
+    bars: list[Candle], side: int, level: float, margin: float = 0.0
 ) -> bool:
-    if len(bars) < 2 or not threes:
-        return False
-    level = boundary + side * margin
-    return (
-        bar_end(threes[-1], 3) >= bars[-1].start
-        and side * (threes[-1].close - level) > 0
-        and accepted_level(bars, side, level)
+    return len(bars) >= 2 and all(
+        passed(b.close, level, side, margin) for b in bars[-2:]
     )
 
 
-def analyze_price(
-    bars: list[Candle], prior_ten: list[Candle], session_open: datetime
-) -> PriceContext:
-    """Walk completed data once in timestamp order. A later bar never relabels an earlier trigger."""
-    bars = contiguous_tail(bars)
-    threes = aggregate(bars, 3, session_open)
-    tens = aggregate(bars, 10, session_open)
-    three_count = 0
-    direction = trend = broken_side = 0
-    protected = broken_level = None
-    broken_at = None
-    bounds = None
-    range_escape = None
-    signals: dict[str, Signal] = {}
-    patterns: dict[int, Pattern] = {}
-    atr = 3.0
+def reversal_pattern(
+    bars: list[Candle], pivots: list[Swing], side: int, atr: float, since: datetime
+) -> Reversal | None:
+    # Index by timestamp to keep both tests and their reaction causal.
+    index = {b.start: n for n, b in enumerate(bars)}
+    distinct = [p for p in pivots if p.at >= since and p.at in index]
+    tolerance = min(15.0, max(3.0, 0.65 * atr))
+    for j in range(len(distinct) - 1, 0, -1):
+        second = distinct[j]
+        right = index[second.at]
+        choices = []
+        for first in distinct[:j]:
+            left = index[first.at]
+            inside = bars[left + 1 : right]
+            if not inside or abs(first.price - second.price) > tolerance:
+                continue
+            stop = min((first, second), key=lambda p: side * p.price)
+            if any(
+                passed(stop.price, protective_edge(b, side), side)
+                for b in bars[left + 1 :]
+            ):
+                continue
+            neckline = max(
+                (favorable_edge(b, side) for b in inside), key=lambda x: side * x
+            )
+            near_test = max(first.price * side, second.price * side)
+            excursion = max(b.close * side for b in inside) - near_test
+            if side * neckline - near_test < max(8.0, 0.5 * atr) or excursion < max(
+                3.0, 0.25 * atr
+            ):
+                continue
+            choices.append(Reversal(side, neckline, first, second, stop))
+        if choices:
+            return max(
+                choices, key=lambda p: (side * (p.neckline - p.stop.price), p.first.at)
+            )
+    return None
 
-    for i, bar in enumerate(bars):
-        prefix = bars[: i + 1]
-        at = bar_end(bar)
-        while three_count < len(threes) and bar_end(threes[three_count], 3) <= at:
-            three_count += 1
-        completed = threes[:three_count]
-        direction = three_direction(completed)
-        atr = volatility(prefix, minimum=2.5)
-        atr3 = volatility(completed, minimum=2.5)
-        prior = prefix[-2] if i else None
-        range_break = None
-        margin = max(1.0, 0.25 * atr)
 
-        if range_escape is not None:
-            escaped = range_escape.signal
-            if at - escaped.at > 2 * DISPATCH_INTERVAL:
-                range_escape = None
-            elif escaped.side * (bar.close - escaped.trigger) <= 0:
-                bounds = range_escape.bounds
-                range_escape = None
-        if bounds is not None:
-            for side, level in ((-1, bounds[0]), (1, bounds[1])):
-                if held_boundary(prefix, completed, side, level, margin):
-                    # The competing range may have been established just
-                    # before this close rolled its first test out of view.
-                    new_bounds = defended_range(prefix[-9:], atr) or defended_range(
-                        prefix[-10:-1], atr
-                    )
-                    if (
-                        new_bounds is not None
-                        and new_bounds[1] - new_bounds[0] < bounds[1] - bounds[0]
-                        and new_bounds[0] < bounds[1]
-                        and new_bounds[1] > bounds[0]
-                        and new_bounds[0] <= bar.close <= new_bounds[1]
-                    ):
-                        # A separately defended, tighter range can straddle
-                        # the old boundary. Its own outer edges still govern.
-                        bounds = new_bounds
-                        break
-                    range_break = Signal(side, 'RANGE_BREAK_HOLD', at, level, level)
-                    range_escape = RangeEscape(bounds, range_break, margin)
-                    bounds = None
-                    break
-        elif range_escape is None:
-            bounds = broader_containment(prefix[-CONTAINMENT_MINUTES:], atr)
-            if bounds is None:
-                bounds = defended_range(prefix[-9:], atr)
+class SessionStructure:
+    """Causal state machine. A bar can confirm a new leg only once."""
 
-        if (
-            trend
-            and protected is not None
-            and accepted_level(prefix, -trend, protected)
+    def __init__(self, opens_at: datetime):
+        self.opens_at = opens_at
+        self.trend = 0
+        self.protected: Swing | None = None
+        self.leg: DirectionalLeg | None = None
+        self.transition: StructureTransition | None = None
+        self.range: TradingRange | None = None
+        self.released_range: TradingRange | None = None
+        self.setup: EntrySetup | None = None
+        self.pivots: dict[int, list[Swing]] = {1: [], -1: []}
+        self.swings3: dict[int, list[Swing]] = {1: [], -1: []}
+
+    def start_leg(
+        self,
+        bar: Candle,
+        side: int,
+        kind: str,
+        trigger: float,
+        stop: Swing,
+        oi_level: float,
+        atr: float,
+        atr3: float,
+        *,
+        break_margin: float = 0.0,
+    ) -> None:
+        now = bar_end(bar)
+        self.trend, self.protected = side, stop
+        self.leg = DirectionalLeg(
+            side, Swing(favorable_edge(bar, side), bar.start, now)
+        )
+        self.setup = EntrySetup(
+            side,
+            kind,
+            trigger,
+            stop,
+            oi_level,
+            now,
+            now + MAX_TRIGGER_AGE,
+            stop.price,
+            now,
+            min(36.0, max(15.0, 1.10 * atr)),
+            min(115.0, max(60.0 if kind == 'REVERSAL' else 48.0, 1.65 * atr3)),
+            break_margin=break_margin,
+        )
+
+    def bootstrap(
+        self, bar: Candle, threes: list[Candle], atr: float, atr3: float
+    ) -> None:
+        if len(threes) < 2 or bar_end(threes[-1], 3) != bar_end(bar):
+            return
+        prior, current = threes[-2:]
+        side = 1 if current.close > prior.close else -1
+        level = favorable_edge(prior, side)
+        if not (
+            passed(current.close, level, side, 0.10 * atr)
+            and abs(current.close - prior.close) >= max(STRONG_MOVE, 0.60 * atr3)
+            and passed(
+                protective_edge(current, side), protective_edge(prior, side), side
+            )
         ):
-            broken_side, broken_level, broken_at = trend, protected, at
-            trend, protected = 0, None
-        if direction and not trend and (not broken_side or direction == -broken_side):
-            prior_block = completed[-2]
-            edge = prior_block.low if direction == 1 else prior_block.high
-            if not accepted_level(prefix, -direction, edge):
-                trend, protected = direction, edge
-        if trend and protected is not None:
-            pivots = swings(completed[-8:], trend, duration=3, left=1)
-            for pivot in reversed(pivots):
-                if trend * (pivot.price - protected) > 0 and trend * (
-                    bar.close - pivot.price
-                ) > max(0.7 * atr, 0.3 * atr3):
-                    protected = pivot.price
-                    break
-        if broken_at and at - broken_at > 18 * MINUTE:
-            broken_side, broken_level, broken_at = 0, None, None
+            return
+        if bar_end(bar) - self.opens_at > OPENING_PHASE:
+            protections, objectives = self.swings3[side], self.swings3[-side]
+            if not (
+                len(protections) >= 2
+                and len(objectives) >= 2
+                and passed(protections[-1].price, protections[-2].price, side)
+                and passed(objectives[-1].price, objectives[-2].price, side)
+                and passed(current.close, objectives[-1].price, side)
+            ):
+                return
+            stop = protections[-1]
+            kind = 'TREND_BREAK'
+        else:
+            stop = Swing(protective_edge(prior, side), prior.start, bar_end(prior, 3))
+            kind = 'OPENING_BREAK'
+        self.start_leg(bar, side, kind, level, stop, stop.price, atr, atr3)
 
-        if i < 4 or at < bar_end(bars[-1]) - (MAX_TRIGGER_AGE + 2 * MINUTE):
-            continue
-
-        def add(signal: Signal):
-            signals[signal.identity] = signal
-
-        if range_break:
-            add(range_break)
+    def advance_range(
+        self,
+        bars: list[Candle],
+        threes: list[Candle],
+        last_ten: Candle | None,
+        atr: float,
+        atr3: float,
+    ) -> bool:
+        bar = bars[-1]
+        now = bar_end(bar)
+        released = self.released_range
+        if released and self.setup and self.setup.kind == 'RANGE_BREAK':
+            if not passed(bar.close, self.setup.trigger, self.setup.side):
+                self.range, self.released_range = released, None
+                self.setup = None
+            elif now > self.setup.expires_at:
+                self.released_range = None
+        if self.range is None and self.released_range is None:
+            self.range = detect_range(bars, threes, last_ten, atr)
+        region = self.range
+        if region is None:
+            return False
+        self.setup = None
+        if (
+            len(threes) < 2
+            or bar_end(threes[-1], 3) != now
+            or now <= region.established_at
+        ):
+            return True
         for side in (1, -1):
-            recent_patterns = local_patterns(prefix[-42:], atr, side)
-            valid_patterns = [
+            level = region.edge(side)
+            if not (
+                held_break(bars, side, level, region.margin)
+                and passed(threes[-1].close, level, side, region.margin)
+                and passed(threes[-1].close, threes[-2].close, side)
+            ):
+                continue
+            defenses = [
                 p
-                for p in recent_patterns
-                if at - p.confirmed_at <= 18 * MINUTE
-                and all(
-                    side * ((b.low if side == 1 else b.high) - p.stop) >= 0
-                    for b in prefix
-                    if b.start >= p.confirmed_at
-                )
+                for p in self.pivots[side]
+                if p.at >= region.established_at - CONTAINMENT_MINUTES * MINUTE
+                and region.low <= p.price <= region.high
             ]
-            pattern = max(
-                valid_patterns,
-                key=lambda p: (p.confirmed_at, p.second.at),
-                default=None,
-            )
-            if pattern is not None:
-                patterns[side] = pattern
-            else:
-                patterns.pop(side, None)
-
-            opposing_pivots = swings(prefix[-32:], -side, left=1)
-            near = max(1.0, 0.25 * atr)
-            for pivot in opposing_pivots:
-                level = pivot.price
-                if pivot.known_at > prior.start or side * (bar.close - level) <= 0:
-                    continue
-                if not any(
-                    side * (b.close - level) > 0
-                    for b in prefix[-8:-2]
-                    if b.start >= pivot.known_at
-                ):
-                    continue
-                edge = bar.low if side == 1 else bar.high
-                if abs(edge - level) <= near and side * (prior.close - level) > 0:
-                    add(
-                        Signal(side, 'DEFENDED_RETEST', at, level, level, True, pattern)
-                    )
-
-            if pattern is not None:
-                accepted = (
-                    broken_side == -side
-                    and broken_level is not None
-                    and side * (bar.close - broken_level) > 0
-                )
-                if accepted:
-                    protected_break = max(
-                        (pattern.neckline, broken_level), key=lambda v: side * v
-                    )
-                    if at == max(pattern.confirmed_at, broken_at):
-                        add(
-                            Signal(
-                                side,
-                                'REVERSAL_BREAK',
-                                at,
-                                protected_break,
-                                protected_break,
-                                reversal=pattern,
-                            )
-                        )
-                    # A fresh break of a rebound/rejection pivot can requalify
-                    # the same reversal when the first scan lacked aligned OI.
-                    for pivot in opposing_pivots:
-                        if (
-                            pivot.at >= pattern.second.at
-                            or pivot.known_at > prior.start
-                        ):
-                            continue
-                        if side * (pivot.price - protected_break) > near and side * (
-                            prior.close - pivot.price
-                        ) <= 0 < side * (bar.close - pivot.price):
-                            add(
-                                Signal(
-                                    side,
-                                    'REVERSAL_BREAK',
-                                    at,
-                                    pivot.price,
-                                    pivot.price,
-                                    reversal=pattern,
-                                )
-                            )
-
-            if direction != side:
-                continue
-            trigger = (
-                max(b.high for b in prefix[-3:-1])
-                if side == 1
-                else min(b.low for b in prefix[-3:-1])
-            )
-            if side * (prior.close - trigger) > 0 or side * (bar.close - trigger) <= 0:
-                continue
-            prior_block = completed[-2]
-            anchor = prior_block.low if side == 1 else prior_block.high
-            add(
-                Signal(
-                    side,
-                    'OPENING_BREAK' if three_count == 2 else 'CONTINUATION_BREAK',
-                    at,
-                    trigger,
-                    anchor,
+            stop = (
+                defenses[-1]
+                if defenses
+                else Swing(
+                    region.edge(-side), region.established_at, region.established_at
                 )
             )
+            self.start_leg(
+                bar,
+                side,
+                'RANGE_BREAK',
+                level,
+                stop,
+                level,
+                atr,
+                atr3,
+                break_margin=region.margin,
+            )
+            self.range, self.released_range = None, region
+            self.transition = None
+            return True
+        return True
 
-    move = acceleration = None
-    if len(threes) >= 2 and threes[-1].start - threes[-2].start == DISPATCH_INTERVAL:
-        move = threes[-1].close - threes[-2].close
+    def advance_transition(
+        self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
+    ) -> None:
+        transition = self.transition
+        assert transition is not None
+        bar = bars[-1]
+        now = bar_end(bar)
+        side = -transition.previous_side
+        if not transition.initial_confirmed:
+            if held_break(bars, -side, transition.protection.price, 0.10 * atr):
+                self.trend, self.protected = -side, transition.protection
+                self.leg = DirectionalLeg(
+                    -side, Swing(favorable_edge(bar, -side), bar.start, now)
+                )
+                self.transition, self.setup = None, None
+                return
+            if now - transition.started_at > EXTREME_CONFIRMATION_AGE:
+                self.transition, self.setup = None, None
+                self.bootstrap(bar, threes, atr, atr3)
+                return
+            pattern = reversal_pattern(
+                bars,
+                self.pivots[side],
+                side,
+                atr,
+                transition.started_at - EXTREME_CONFIRMATION_AGE,
+            )
+            transition.pattern = pattern
+            if pattern is None:
+                return
+            boundary = max(
+                (pattern.neckline, transition.protection.price), key=lambda x: side * x
+            )
+            if not held_break(bars, side, boundary):
+                return
+            objectives = [
+                p
+                for p in self.pivots[-side]
+                if pattern.first.at - 12 * MINUTE <= p.at < pattern.first.at
+                and passed(p.price, boundary, side, max(2.0, 0.35 * atr))
+            ]
+            transition.expansion_level = objectives[-1].price if objectives else None
+            transition.initial_confirmed = True
+            self.start_leg(
+                bar, side, 'REVERSAL', boundary, pattern.stop, boundary, atr, atr3
+            )
+            return
+
+        pattern = transition.pattern
+        if pattern is None or not passed(bar.close, pattern.stop.price, side):
+            # A failed reversal invalidates its setup; reassess from newly
+            # confirmed structure rather than resuming the failed candidate.
+            self.trend, self.protected, self.leg = 0, None, None
+            self.transition, self.setup = None, None
+            return
+        level = transition.expansion_level
         if (
-            len(threes) >= 3
-            and threes[-2].start - threes[-3].start == DISPATCH_INTERVAL
+            level is not None
+            and passed(bar.close, level, side)
+            and not passed(bars[-2].close, level, side)
         ):
-            acceleration = move - (threes[-2].close - threes[-3].close)
+            # This level was fixed when the reversal was confirmed. It is
+            # not a rolling high or low printed by the current impulse.
+            self.start_leg(bar, side, 'REVERSAL', level, pattern.stop, level, atr, atr3)
+            transition.expansion_level = None
+            return
+        if now - transition.started_at > EXTREME_CONFIRMATION_AGE:
+            self.transition = None
+        self.advance_leg(bar, threes, atr, atr3)
+
+    def advance_leg(
+        self, bar: Candle, threes: list[Candle], atr: float, atr3: float
+    ) -> None:
+        leg = self.leg
+        if leg is None:
+            return
+        side = leg.side
+        now = bar_end(bar)
+        edge = favorable_edge(bar, side)
+        opposite = protective_edge(bar, side)
+        if leg.pullback is not None:
+            if passed(leg.pullback.price, opposite, side):
+                leg.pullback = Swing(opposite, bar.start, now)
+            if passed(bar.close, leg.extreme.price, side, 0.05):
+                if self.protected and passed(
+                    leg.pullback.price, self.protected.price, side
+                ):
+                    reference = (
+                        protective_edge(threes[-2], side)
+                        if len(threes) >= 2
+                        else leg.pullback.price
+                    )
+                    self.start_leg(
+                        bar,
+                        side,
+                        'PULLBACK_RESUMPTION',
+                        leg.extreme.price,
+                        leg.pullback,
+                        reference,
+                        atr,
+                        atr3,
+                    )
+                    return
+                leg.pullback = None
+                leg.extreme = Swing(edge, bar.start, now)
+            return
+
+        if passed(edge, leg.extreme.price, side):
+            leg.extreme = Swing(edge, bar.start, now)
+        opening = now - self.opens_at <= OPENING_PHASE
+        distance = (
+            max(10.0, 0.50 * atr, 0.25 * atr3)
+            if opening
+            else max(12.0, 0.85 * atr, 0.85 * atr3)
+        )
+        if side * (leg.extreme.price - bar.close) >= distance:
+            leg.pullback = Swing(opposite, bar.start, now)
+
+    def advance(
+        self,
+        bars: list[Candle],
+        threes: list[Candle],
+        last_ten: Candle | None,
+        atr: float,
+        atr3: float,
+    ) -> None:
+        bar = bars[-1]
+        now = bar_end(bar)
+        for side in (1, -1):
+            pivot = confirmed_swing(bars, side, 1)
+            if pivot:
+                self.pivots[side].append(pivot)
+            if threes and bar_end(threes[-1], 3) == now:
+                pivot3 = confirmed_swing(threes, side, 3)
+                if pivot3:
+                    self.swings3[side].append(pivot3)
+
+        if self.advance_range(bars, threes, last_ten, atr, atr3):
+            return
+
+        if (
+            self.trend
+            and self.protected
+            and held_break(bars, -self.trend, self.protected.price, 0.10 * atr)
+        ):
+            self.transition = StructureTransition(self.trend, self.protected, now)
+            self.trend, self.protected, self.leg, self.setup = 0, None, None, None
+
+        if self.transition:
+            self.advance_transition(bars, threes, atr, atr3)
+        elif self.trend:
+            self.advance_leg(bar, threes, atr, atr3)
+        else:
+            self.bootstrap(bar, threes, atr, atr3)
+
+        # A confirmed higher low/lower high can tighten the trend boundary
+        # without making a new entry setup or moving an active position's stop.
+        side, protected, leg = self.trend, self.protected, self.leg
+        if side and protected and leg and leg.pullback is None and self.swings3[side]:
+            swing = self.swings3[side][-1]
+            if (
+                swing.known_at == now
+                and swing.at > protected.at
+                and passed(swing.price, protected.price, side)
+            ):
+                self.protected = swing
+
+        setup = self.setup
+        if (
+            setup
+            and setup.defended_at is None
+            and now > setup.confirmed_at
+            and now <= setup.expires_at
+            and len(bars) >= 2
+            and abs(protective_edge(bar, setup.side) - setup.trigger)
+            <= max(1.0, 0.20 * atr)
+            and held_break(bars, setup.side, setup.trigger)
+        ):
+            self.setup = replace(setup, defended_at=now)
+
+
+def analyze_price(
+    bars: list[Candle], prior_ten: list[Candle], opens_at: datetime
+) -> PriceContext:
+    bars = contiguous_tail(bars)
+    all_threes = aggregate(bars, 3, opens_at)
+    all_tens = aggregate(bars, 10, opens_at)
+    engine = SessionStructure(opens_at)
+    recent: list[Candle] = []
+    threes: list[Candle] = []
+    tens: list[Candle] = []
+    atr = atr3 = 2.5
+    for bar in bars:
+        recent.append(bar)
+        if len(threes) < len(all_threes) and bar_end(
+            all_threes[len(threes)], 3
+        ) <= bar_end(bar):
+            threes.append(all_threes[len(threes)])
+        if len(tens) < len(all_tens) and bar_end(all_tens[len(tens)], 10) <= bar_end(
+            bar
+        ):
+            tens.append(all_tens[len(tens)])
+        atr = volatility(recent, minimum=2.5)
+        atr3 = volatility(threes, minimum=2.5)
+        engine.advance(recent, threes, tens[-1] if tens else None, atr, atr3)
+    move = threes[-1].close - threes[-2].close if len(threes) >= 2 else None
+    acceleration = (
+        move - (threes[-2].close - threes[-3].close) if len(threes) >= 3 else None
+    )
     return PriceContext(
         bars,
         threes,
         tens,
         prior_ten,
         atr,
-        volatility(threes, minimum=2.5),
-        volatility(tens or prior_ten, minimum=2.5),
-        direction,
+        atr3,
+        engine.trend,
+        engine.protected,
+        engine.range,
+        engine.transition,
+        engine.setup,
         move,
         acceleration,
-        trend,
-        protected,
-        broken_side,
-        broken_level,
-        broken_at,
-        bounds,
-        patterns,
-        list(signals.values()),
-        range_escape,
+        engine.released_range,
     )
 
 
-def market_targets(
-    ctx: PriceContext, window: OIWindow, spot: float, side: int
-) -> dict[float, str]:
-    levels = {}
-    # Intraday levels use only complete ten-minute blocks. The previous
-    # session is retained for structural extensions and reversal context.
-    for bar in ctx.tens[-12:]:
-        value = bar.high if side == 1 else bar.low
-        levels[value] = 'COMPLETED_10M'
-    for pivot in swings(ctx.prior_ten, -side, duration=10, left=1):
-        levels.setdefault(pivot.price, 'PRIOR_10M_SWING')
-    for level in oi_levels(window, spot, side, ctx.atr):
-        levels.setdefault(level.strike, 'OI_LEVEL')
-    return levels
-
-
-def risk_plan(
-    signal: Signal,
-    ctx: PriceContext,
-    spot: float,
-    grid: list[float],
-    window: OIWindow,
-    cfg: Config,
-) -> tuple[RiskPlan | None, str, dict]:
-    side = signal.side
-    if signal.reversal is not None:
-        pattern = signal.reversal
-        swing = min((pattern.first, pattern.second), key=lambda p: side * p.price)
-        stop, stop_time, stop_source = swing.price, swing.at, 'REVERSAL_SWING'
-        if cfg.reversal_strike_stop:
-            outer = [strike for strike in grid if 0 < side * (stop - strike) <= ctx.atr]
-            if outer:
-                stop, stop_source = (
-                    nearest_strike(outer, stop),
-                    'STRIKE_BEYOND_REVERSAL_SWING',
-                )
-    elif ctx.threes:
-        bar = ctx.threes[-1]
-        stop, stop_time, stop_source = (
-            bar.close,
-            bar_end(bar, 3),
-            'LATEST_COMPLETED_3M_CLOSE',
-        )
-    else:
-        return None, 'COMPLETED_3M_STOP_UNAVAILABLE', {}
-    risk = side * (spot - stop)
-    minimum_risk = max(MIN_STOP_POINTS, MIN_STOP_ATR_FRACTION * ctx.atr)
-    evidence = {
-        'stop': stop,
-        'stop_at': stop_time.isoformat(),
-        'stop_source': stop_source,
-        'risk_points': round(risk, 4),
-        'minimum_stop_clearance': round(minimum_risk, 4),
-        'target_anchor': spot,
-        'minimum_reward_risk': cfg.min_reward_risk,
-    }
-    if risk <= 0:
-        return None, 'STOP_WRONG_SIDE_OF_LIVE_SPOT', evidence
-    if risk + 1e-9 < minimum_risk:
-        return None, 'STOP_TOO_CLOSE_TO_LIVE_SPOT', evidence
-
-    levels = market_targets(ctx, window, spot, side)
-
-    def choose(
-        bounds: tuple[float, float], ideal: float, fallback: bool = True
-    ) -> tuple[float, str] | None:
-        low, high = bounds
-        included = [
-            (value, source)
-            for value, source in levels.items()
-            if low <= side * (value - spot) <= high
-        ]
-        if included:
-            return min(
-                included,
-                key=lambda row: (
-                    abs(side * (row[0] - spot) - ideal),
-                    row[1] != 'COMPLETED_10M',
-                    side * row[0],
-                ),
-            )
-        if fallback:
-            return round(spot + side * ideal, 4), 'ENTRY_SPOT_DISTANCE'
-        return None
-
-    if signal.reversal:
-        t1, source1 = choose((35.0, 65.0), 47.5, False) or choose(T1_SPOT_BAND, 47.5)
-        t2, source2 = choose(
-            (max(65.0, side * (t1 - spot) + 15), 115.0), 85.0, False
-        ) or choose(T2_SPOT_BAND, 85.0)
-    else:
-        t1, source1 = choose(T1_SPOT_BAND, 47.5)
-        t2, source2 = choose(T2_SPOT_BAND, 85.0)
-    if not (t2 > 0 and side * (t1 - spot) > 0 and side * (t2 - t1) > 0):
-        return None, 'INVALID_TARGET_LEVELS', evidence
-    reward = side * (t1 - spot) / risk
-    evidence.update(t1=t1, t2=t2, reward_risk=round(reward, 4))
-    if cfg.min_reward_risk and reward + 1e-10 < cfg.min_reward_risk:
-        return None, 'T1_REWARD_TO_RISK_BELOW_MINIMUM', evidence
-    policy = 'REVERSAL_SWING' if signal.reversal else 'CONTINUATION_TOUCH'
-    return (
-        RiskPlan(
-            stop, t1, t2, source1, source2, round(risk, 4), round(reward, 4), policy
+def last_stop_boundary(
+    state: dict, setup: EntrySetup, ctx: PriceContext, spot: float
+) -> tuple[str | None, dict]:
+    last = state.get('last_exit')
+    if not last:
+        return None, {}
+    exited = timestamp(last['at'])
+    if exited.date() != ctx.through.date():
+        return None, {}
+    if setup.confirmed_at <= exited:
+        return 'SETUP_PREDATES_EXIT', {}
+    direction = 'BULLISH' if setup.side == 1 else 'BEARISH'
+    reason = last.get('reason') or next(
+        (
+            p.get('exit_reason')
+            for p in reversed(state['history'])
+            if p.get('id') == last.get('id')
         ),
-        'QUALIFIED',
-        evidence,
+        None,
     )
-
-
-@dataclass(frozen=True)
-class Setup:
-    signal: Signal
-    plan: RiskPlan
-    pair: OIPair
-    rule: str
-    risk: dict
-
-
-def evaluate_setups(
-    ctx: PriceContext,
-    spot: float,
-    grid: list[float],
-    pairs: dict[float, OIPair],
-    window: OIWindow,
-    cfg: Config,
-    since: datetime,
-    slot: datetime,
-    consumed: list[str],
-) -> tuple[list[dict], list[Setup]]:
-    decisions, setups = [], []
-    for signal in sorted(
-        ctx.signals,
-        key=lambda s: (
-            s.kind != 'RANGE_BREAK_HOLD',
-            not bool(s.reversal),
-            not s.defended,
-            -s.at.timestamp(),
-            abs(spot - s.trigger),
-            s.identity,
-        ),
+    if last.get('direction') != direction or reason not in ('STRUCTURAL_SL', None):
+        return None, {}
+    prior = [b for b in ctx.bars if bar_end(b) <= exited][-STOP_REENTRY_LOOKBACK:]
+    if len(prior) < 6:
+        return 'POST_STOP_STRUCTURE_UNAVAILABLE', {}
+    side = setup.side
+    edge = max((favorable_edge(b, side) for b in prior), key=lambda x: side * x)
+    margin = max(1.0, 0.25 * volatility(prior, minimum=2.5))
+    post = [b for b in ctx.bars if b.start >= exited]
+    evidence = {'exit_at': exited.isoformat(), 'post_stop_outer_boundary': edge}
+    if not (
+        setup.stop.at >= exited
+        and ctx.threes
+        and ctx.threes[-1].start >= exited
+        and held_break(post, side, edge, margin)
+        and passed(ctx.threes[-1].close, edge, side, margin)
+        and passed(spot, edge, side, margin)
     ):
-        side = signal.side
-        strike = nearest_strike(grid, signal.oi_level)
-        pair = pairs.get(strike, OIPair(strike, None, None))
-        rule = pair.rule(side, signal.defended)
-        detail = {
-            'identity': signal.identity,
-            'signal': jsonable(asdict(signal)),
-            'oi_level': signal.oi_level,
-            'mapped_strike': strike,
-            'paired_oi_at_level': pair.public(),
-            'oi_rule': rule,
-        }
-        decisions.append(detail)
-        extension = side * (spot - signal.trigger)
-        cap = min(30.0, max(8.0, cfg.max_chase_atr * ctx.atr))
-        detail.update(extension=round(extension, 4), extension_cap=round(cap, 4))
-        if signal.identity in consumed or signal.at <= since:
-            detail['reason'] = 'TRIGGER_ALREADY_EVALUATED'
-        elif signal.at > slot or slot - signal.at > MAX_TRIGGER_AGE:
-            detail['reason'] = 'TRIGGER_OUTSIDE_DISPATCH_WINDOW'
-        elif ctx.bounds is not None:
-            detail['reason'] = 'INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD'
-        elif ctx.range_escape is not None and not ctx.range_escape.permits(
-            signal, spot, ctx.bars[-1].close
-        ):
-            detail['reason'] = 'OUTER_RANGE_BREAK_NOT_CONFIRMED_FOR_TRIGGER'
-        elif signal.reversal and not any(
-            (
-                ctx.broken_side == -side
-                and ctx.broken_level is not None
-                and side * (ctx.bars[-1].close - ctx.broken_level) > 0
-                and side * (spot - ctx.broken_level) > 0
-                and ctx.trend != -side,
-                signal.defended
-                and ctx.trend == side
-                and any(
-                    three_direction(ctx.threes[:i]) == side
-                    for i in range(max(2, len(ctx.threes) - 2), len(ctx.threes) + 1)
-                ),
-            )
-        ):
-            detail['reason'] = 'OPPOSING_PROTECTED_STRUCTURE_INTACT'
-        elif signal.kind == 'RANGE_BREAK_HOLD' and not (
-            ctx.range_escape is not None and signal == ctx.range_escape.signal
-        ):
-            detail['reason'] = 'RANGE_BREAK_NO_LONGER_HELD'
-        elif (
-            not signal.reversal
-            and signal.kind != 'RANGE_BREAK_HOLD'
-            and (ctx.direction != side or ctx.trend not in (0, side))
-        ):
-            detail['reason'] = 'THREE_MINUTE_STRUCTURE_NOT_ALIGNED'
-        elif extension <= 0 or side * (ctx.bars[-1].close - signal.trigger) <= 0:
-            detail['reason'] = 'PRICE_BACK_BEHIND_TRIGGER'
-        elif extension > cap:
-            detail['reason'] = 'ENTRY_EXTENDED'
-        elif rule is None:
-            detail['reason'] = (
-                'PAIRED_OI_UNAVAILABLE'
-                if pair.changes is None
-                else 'PAIRED_OI_NOT_DIRECTIONAL'
-            )
-        else:
-            plan, reason, evidence = risk_plan(signal, ctx, spot, grid, window, cfg)
-            detail.update(reason=reason, risk_evidence=evidence)
-            if plan is not None:
-                setups.append(Setup(signal, plan, pair, rule, evidence))
-    return decisions, setups
+        return 'POST_STOP_OUTER_BREAK_AND_HOLD_REQUIRED', evidence
+    return None, evidence
 
 
-def directional_contracts(
-    band: StrikeBand, setup: Setup, listed: dict
+def strike_choices(
+    band: StrikeBand, setup: EntrySetup, listed: dict[tuple[str, float], dict]
 ) -> list[tuple[int, OIPair, dict, str]]:
-    signal = setup.signal
-    side = signal.side
-    choices = []
+    side = setup.side
+    kind = 'CE' if side == 1 else 'PE'
+    output = []
     for offset in (-side, -2 * side):
         pair = band.pairs.get(offset)
         if pair is None:
             continue
-        row = listed.get(('CE' if side == 1 else 'PE', pair.strike))
-        rule = pair.rule(side, signal.defended)
-        if row is not None and rule:
-            choices.append((offset, pair, row, rule))
-    return choices
+        contract = listed.get((kind, pair.strike))
+        confirmation = pair.rule(side, setup.defended_at is not None)
+        if contract is not None and confirmation:
+            output.append((offset, pair, contract, confirmation))
+    return output
 
 
-def post_exit_entry_check(
-    signal: Signal, ctx: PriceContext, spot: float, last_exit: dict, history: list[dict]
-) -> dict:
-    """Require a new outer break for a same-side entry following a stop."""
-    exited = timestamp(last_exit['at'])
-    check = {'trigger': signal.identity, 'previous_exit_at': exited.isoformat()}
-    if signal.at <= exited:
-        return dict(check, reason='REENTRY_REQUIRES_NEW_POST_EXIT_TRIGGER')
-    direction = 'BULLISH' if signal.side == 1 else 'BEARISH'
-    if exited.date() != ctx.at.date() or last_exit.get('direction') != direction:
-        return dict(check, reason='QUALIFIED')
-    reason = last_exit.get('reason')
-    if reason is None:
-        # Existing v136 state stores the reason on the closed position.
-        reason = next(
-            (
-                row.get('exit_reason')
-                for row in reversed(history)
-                if row.get('id') == last_exit.get('id')
-            ),
-            None,
-        )
-    if reason not in ('STRUCTURAL_SL', None):
-        return dict(check, reason='QUALIFIED')
+def select_targets(
+    ctx: PriceContext,
+    window: OIWindow,
+    spot: float,
+    side: int,
+    kind: str,
+) -> tuple[tuple[float, str], tuple[float, str]]:
+    levels = {favorable_edge(b, side): 'COMPLETED_10M' for b in ctx.tens[-12:]}
+    for pivot in swings(ctx.prior_ten, -side, duration=10, left=1):
+        levels.setdefault(pivot.price, 'PRIOR_10M_SWING')
+    for level in oi_levels(window, spot, side, ctx.atr):
+        levels.setdefault(level.strike, 'OI_LEVEL')
 
-    prior = [bar for bar in ctx.bars if bar_end(bar) <= exited][-STOP_REENTRY_LOOKBACK:]
-    if len(prior) < 6:
-        return dict(check, reason='POST_STOP_STRUCTURE_UNAVAILABLE')
-    side = signal.side
-    boundary = (
-        max(bar.high for bar in prior) if side == 1 else min(bar.low for bar in prior)
+    def choose(
+        bounds: tuple[float, float], reversal_bounds: tuple[float, float]
+    ) -> tuple[float, str]:
+        middle = sum(bounds) / 2
+        structural = reversal_bounds if kind == 'REVERSAL' else bounds
+        usable = [
+            (price, source)
+            for price, source in levels.items()
+            if structural[0] <= side * (price - spot) <= structural[1]
+        ]
+        if usable:
+            return min(
+                usable,
+                key=lambda item: (
+                    abs(side * (item[0] - spot) - middle),
+                    item[1] != 'COMPLETED_10M',
+                    side * item[0],
+                ),
+            )
+        return round(spot + side * middle, 4), 'ENTRY_SPOT_DISTANCE'
+
+    return choose(T1_SPOT_BAND, (35.0, 64.99)), choose(T2_SPOT_BAND, (65.0, 115.0))
+
+
+TERMINAL_SETUP_STATES = frozenset({'INVALIDATED', 'EXPIRED', 'ENTERED'})
+
+
+@dataclass(frozen=True)
+class EntryAssessment:
+    status: str
+    reason: str
+    evidence: dict
+    plan: RiskPlan | None = None
+    choices: tuple[tuple[int, OIPair, dict, str], ...] = ()
+
+
+def assess_entry(
+    setup: EntrySetup,
+    ctx: PriceContext,
+    state: dict,
+    spot: float,
+    window: OIWindow,
+    grid: list[float],
+    band: StrikeBand,
+    listed: dict[tuple[str, float], dict],
+    cfg: Config,
+) -> EntryAssessment:
+    side = setup.side
+    risk = side * (spot - setup.stop.price)
+    trigger_distance = side * (spot - setup.trigger)
+    leg_distance = side * (spot - setup.leg_anchor)
+    minimum = max(MIN_STOP_POINTS, MIN_STOP_ATR_FRACTION * ctx.atr)
+    source = (
+        'REVERSAL_SWING' if setup.kind == 'REVERSAL' else 'CONFIRMED_STRUCTURAL_SWING'
     )
-    margin = max(1.0, 0.25 * volatility(prior, minimum=2.5))
-    post = [bar for bar in ctx.bars if bar.start >= exited]
-    threes = [bar for bar in ctx.threes if bar.start >= exited]
-    check.update(outer_boundary=boundary, clearance_points=round(margin, 4))
-    # A continuation trigger comes from the preceding swing and may sit just
-    # inside the boundary. It must still belong to the new break, not the
-    # earlier leg. An older range boundary alone cannot authorize re-entry.
-    if (
-        not held_boundary(post, threes, side, boundary, margin)
-        or side * (spot - boundary) <= margin
-        or side * (signal.trigger - boundary) < -margin
+    evidence = {
+        'spot': spot,
+        'stop': setup.stop.price,
+        'stop_at': setup.stop.at.isoformat(),
+        'stop_known_at': setup.stop.known_at.isoformat(),
+        'stop_source': source,
+        'risk_points': round(risk, 4),
+        'minimum_stop_clearance': round(minimum, 4),
+        'maximum_initial_risk': cfg.max_initial_risk_points,
+        'risk_budget_exceeded': risk > cfg.max_initial_risk_points,
+        'trigger_extension': round(trigger_distance, 4),
+        'trigger_limit': setup.trigger_limit,
+        'leg_extension': round(leg_distance, 4),
+        'leg_limit': setup.leg_limit,
+        'atm': band.atm,
+    }
+
+    def blocked(reason: str, status: str = 'WAITING_CONFIRMATION') -> EntryAssessment:
+        return EntryAssessment(status, reason, evidence)
+
+    if ctx.trading_range:
+        return blocked('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD', 'INVALIDATED')
+    if risk <= 0 or any(
+        not passed(protective_edge(b, side), setup.stop.price, side)
+        for b in ctx.bars
+        if b.start >= setup.confirmed_at
     ):
-        return dict(check, reason='POST_STOP_OUTER_BREAK_AND_HOLD_REQUIRED')
-    return dict(check, reason='QUALIFIED')
+        return blocked('STRUCTURAL_STOP_INVALIDATED', 'INVALIDATED')
+    if trigger_distance > setup.trigger_limit or leg_distance > setup.leg_limit:
+        return blocked('ENTRY_EXTENDED_FROM_TRIGGER_OR_LEG', 'INVALIDATED')
+    margin = 0.0 if setup.defended_at else setup.break_margin
+    if not passed(spot, setup.trigger, side, margin) or not passed(
+        ctx.bars[-1].close, setup.trigger, side, margin
+    ):
+        return blocked('PRICE_BACK_BEHIND_TRIGGER')
+    if setup.kind != 'REVERSAL' and (
+        ctx.trend != side
+        or ctx.move is None
+        or (side * ctx.move <= 0 and setup.defended_at is None)
+    ):
+        return blocked('COMPLETED_3M_DIRECTION_NOT_CONFIRMED')
+    if risk + 1e-9 < minimum:
+        return blocked('STOP_TOO_CLOSE_TO_LIVE_SPOT')
+    if risk > cfg.max_initial_risk_points:
+        return blocked('STOP_EXCEEDS_RISK_BUDGET')
+    reentry_reason, reentry_evidence = last_stop_boundary(state, setup, ctx, spot)
+    evidence.update(reentry_evidence)
+    if reentry_reason:
+        return blocked(
+            reentry_reason,
+            'INVALIDATED'
+            if reentry_reason == 'SETUP_PREDATES_EXIT'
+            else 'WAITING_CONFIRMATION',
+        )
+
+    pairs = paired_oi(window)
+    strike = nearest_strike(grid, setup.oi_level)
+    pair = pairs.get(strike, OIPair(strike, None, None))
+    oi_rule = pair.rule(side, setup.defended_at is not None)
+    choices = strike_choices(band, setup, listed)
+    evidence.update(
+        oi_level=setup.oi_level,
+        structure_oi=pair.public(),
+        structure_oi_rule=oi_rule,
+        eligible_strikes=[p.strike for _, p, _, _ in choices],
+    )
+    if oi_rule is None:
+        return blocked(
+            'STRUCTURE_LEVEL_OI_MISSING'
+            if pair.changes is None
+            else 'STRUCTURE_LEVEL_OI_NOT_ALIGNED'
+        )
+    if not choices:
+        return blocked('NO_DIRECTIONAL_OI_AT_ELIGIBLE_OFFSETS')
+    (t1, t1_source), (t2, t2_source) = select_targets(
+        ctx, window, spot, side, setup.kind
+    )
+    if not 0 < min(t1, t2) or not passed(t1, spot, side) or not passed(t2, t1, side):
+        return blocked('INVALID_TARGET_LEVELS', 'INVALIDATED')
+    reward = side * (t1 - spot) / risk
+    evidence.update(t1=t1, t2=t2, reward_risk=round(reward, 4))
+    if cfg.min_reward_risk and reward < cfg.min_reward_risk:
+        return blocked('T1_REWARD_TO_RISK_BELOW_MINIMUM')
+    plan = RiskPlan(
+        setup.stop.price,
+        t1,
+        t2,
+        t1_source,
+        t2_source,
+        round(risk, 4),
+        round(reward, 4),
+        source,
+    )
+    return EntryAssessment(
+        'QUALIFIED', 'PRICE_OI_AND_RISK_QUALIFIED', evidence, plan, tuple(choices)
+    )
+
+
+def record_setup(
+    engine: dict, setup: EntrySetup, status: str, reason: str, now: datetime
+) -> dict:
+    ledger = engine.setdefault('v137_setups', {})
+    old = ledger.get(setup.identity, {})
+    history = old.get('observations', 0) + 1
+    record = {
+        'id': setup.identity,
+        'status': status,
+        'reason': reason,
+        'at': now.isoformat(),
+        'observations': history,
+        'confirmed_at': setup.confirmed_at.isoformat(),
+        'expires_at': setup.expires_at.isoformat(),
+    }
+    ledger[setup.identity] = record
+    if len(ledger) > 80:
+        del ledger[next(iter(ledger))]
+    return record
+
+
+def entry_quote_candidates(
+    setup: EntrySetup,
+    grid: list[float],
+    band: StrikeBand,
+    pairs: dict[float, OIPair],
+    listed: dict[tuple[str, float], dict],
+) -> tuple[list[float], list[str]]:
+    center = grid.index(band.atm)
+    nearby = grid[max(0, center - 1) : center + 2]
+    keys = dict.fromkeys(
+        row['instrument_key']
+        for atm in nearby
+        for _, _, row, _ in strike_choices(
+            StrikeBand.build(grid, atm, pairs), setup, listed
+        )
+    )
+    return nearby, list(keys)
 
 
 # Reference position management. Candle observations and live quotes have
@@ -2329,6 +2452,23 @@ def manage_reference(
                 'STRUCTURAL_SL',
                 stop,
                 'COMPLETED_1M_STOP_TOUCH',
+                observation,
+            )
+
+        if (
+            runner
+            and runner.get('reached_at')
+            and not t2_active
+            and at >= timestamp(runner['reached_at']) + DISPATCH_INTERVAL
+        ):
+            # Give the checkpoint one dispatch interval to resolve into a
+            # published structural target. A validated stop still takes priority.
+            return finish(
+                'EXIT',
+                at,
+                'RUNNER_CONTINUATION_NOT_CONFIRMED',
+                bar.close,
+                'COMPLETED_1M_CLOSE_AFTER_RUNNER_CHECKPOINT',
                 observation,
             )
 
@@ -2492,23 +2632,171 @@ def refine_reference(
     )
 
 
+class ScanClock:
+    def __init__(self, read=None, sink=None):
+        self.read = read or (lambda: datetime.now(IST))
+        self.sink = sink
+        self.samples: list[str] = []
+        self.last: datetime | None = None
+
+    def __call__(self) -> datetime:
+        value = self.read()
+        if value.tzinfo is None:
+            raise DataError('Scan clock requires a timezone')
+        value = value.astimezone(IST)
+        if self.last is not None and value < self.last:
+            raise DataError('Scan clock moved backward')
+        self.last = value
+        self.samples.append(value.isoformat())
+        if self.sink is not None:
+            self.sink.append(self.samples[-1])
+        return value
+
+
+def add_position_events(
+    state: dict, result: dict, cfg: Config, position, events, closed, warnings, now
+) -> None:
+    result['management_warnings'] = warnings
+    for kind, detail in events:
+        result['alerts_created'].append(new_event(state, kind, detail, now))
+    if closed is not None:
+        state['history'] = (state['history'] + [closed])[-cfg.max_state_history :]
+        state['last_exit'] = {
+            'at': closed['closed_at'],
+            'direction': closed['direction'],
+            'id': closed['id'],
+            'reason': closed['exit_reason'],
+        }
+    state['position'] = position
+    result['position_locked'] = position is not None
+    result['decision'] = 'POSITION_CLOSED' if closed else 'POSITION_OPEN'
+    result['reason'] = closed['exit_reason'] if closed else 'REFERENCE_POSITION_MANAGED'
+
+
+def capture_price(
+    price: ClosedPrice, api, clock: ScanClock, session, cfg: Config, result: dict
+) -> ClosedPrice:
+    try:
+        raw = api.candles()
+        return merge_closed_price(price, raw, clock(), session, cfg)
+    except (DataError, ProviderError) as exc:
+        result['candle_error'] = str(exc)
+        return price
+
+
+def capture_oi(
+    api, engine: dict, clock: ScanClock, cfg: Config, result: dict
+) -> tuple[list[dict], OIWindow | None]:
+    try:
+        expiry, contracts = api.contracts(clock.last.date())
+        chain = api.chain(expiry, contracts)
+        received = clock()
+        slot = exact_minute(received - timedelta(seconds=cfg.feed_grace_seconds))
+        sample = make_oi_snapshot(chain, expiry, received, slot)
+        ring = engine['oi_samples']
+        window = match_oi(ring, sample, cfg)
+        retained = [s for s in ring if received - timestamp(s['at']) < 15 * MINUTE]
+        if not any(
+            s['through'] == slot.isoformat() and s['expiry'] == expiry for s in retained
+        ):
+            retained.append(jsonable(asdict(sample)))
+        engine['oi_samples'] = retained[-8:]
+        result['oi'] = {
+            'status': 'MATCHED' if window else 'OI_WINDOW_UNAVAILABLE',
+            'at': sample.at.isoformat(),
+            'through': slot.isoformat(),
+            'expiry': expiry,
+            'baseline': window.baseline.isoformat() if window else None,
+            'matched_contracts': len(window.changes) if window else 0,
+        }
+        return contracts, window
+    except (DataError, ProviderError, KeyError, ValueError, TypeError) as exc:
+        clock()
+        result['oi'] = {'status': 'OPTION_CHAIN_UNAVAILABLE', 'reason': str(exc)}
+        return [], None
+
+
+def open_position(
+    state: dict,
+    engine: dict,
+    result: dict,
+    setup: EntrySetup,
+    assessment: EntryAssessment,
+    ctx: PriceContext,
+    window: OIWindow,
+    contract: dict,
+    spot: float,
+    now: datetime,
+    cfg: Config,
+) -> None:
+    plan = assessment.plan
+    assert plan is not None
+    direction = 'BULLISH' if setup.side == 1 else 'BEARISH'
+    key = contract['instrument_key']
+    pos_id = hashlib.sha256(
+        f'{now.date()}|{setup.identity}|{key}'.encode()
+    ).hexdigest()[:22]
+    position = {
+        'id': pos_id,
+        'status': 'OPEN',
+        'direction': direction,
+        'side': contract['side'],
+        'strike': contract['strike'],
+        'expiry': contract['expiry'],
+        'instrument_key': key,
+        'opened_at': now.isoformat(),
+        'entry_spot': spot,
+        'entry_ask': contract['ask'],
+        'initial_stop': plan.stop,
+        'setup_level': setup.trigger,
+        'setup_invalidation': plan.stop,
+        'last_candle': ctx.bars[-1].start.isoformat(),
+        'scenario': setup.kind,
+        't1_hit': False,
+        'remaining_pct': 100,
+        'contract': contract,
+        **asdict(plan),
+    }
+    if (
+        cfg.arm_continuation_runner
+        and setup.kind in ('OPENING_BREAK', 'TREND_BREAK', 'PULLBACK_RESUMPTION')
+        and ctx.move is not None
+        and setup.side * ctx.move >= STRONG_MOVE
+        and runner_price_support(ctx.threes, setup.side)
+    ):
+        position['runner'] = {'checkpoint': plan.t2, 'armed_at': now.isoformat()}
+    state['position'] = position
+    result['setup'] = record_setup(
+        engine, setup, 'ENTERED', 'QUALIFIED_' + contract['side'], now
+    )
+    event = position_event_payload(
+        position,
+        now,
+        reason='QUALIFIED_PRICE_AND_3M_OI',
+        signal=jsonable(asdict(setup)),
+        plan=asdict(plan),
+        entry_evidence=result['entry_evidence'],
+        risk_evidence=assessment.evidence,
+        oi={
+            'window': result['oi'],
+            'confirmation_pair': assessment.evidence['structure_oi'],
+            'rule': assessment.evidence['structure_oi_rule'],
+        },
+    )
+    result['alerts_created'].append(new_event(state, 'ENTRY', event, now))
+    result.update(
+        decision='ENTRY',
+        reason='QUALIFIED_' + contract['side'],
+        position_locked=True,
+        selected_position=position,
+        final_risk_evidence=assessment.evidence,
+    )
+
+
 def scan(
     state: dict, api, cfg: Config, clock_fn=None, clock_sink: list | None = None
 ) -> tuple[dict, list[str]]:
-    times: list[str] = []
-
-    def clock() -> datetime:
-        t = (clock_fn or (lambda: datetime.now(IST)))()
-        if t.tzinfo is None:
-            raise DataError('Scan clock requires a timezone')
-        time_now = t.astimezone(IST)
-        if times and time_now < timestamp(times[-1]):
-            raise DataError('Scan clock moved backward')
-        times.append(time_now.isoformat())
-        if clock_sink is not None:
-            clock_sink.append(times[-1])
-        return time_now
-
+    clock = ScanClock(clock_fn, clock_sink)
     now = clock()
     engine = ensure_engine(state, now)
     active = state.get('position')
@@ -2523,31 +2811,14 @@ def scan(
         'evaluations': [],
     }
 
-    def no_trade(reason: str):
+    def finish(reason: str, status: str | None = None, setup: EntrySetup | None = None):
+        if status is not None and setup is not None:
+            result['setup'] = record_setup(engine, setup, status, reason, clock.last)
         if result['decision'] in ('POSITION_OPEN', 'POSITION_CLOSED'):
             result['entry_check'] = reason
         else:
             result['reason'] = reason
-        return result, times
-
-    def save_position(position, events, closed, warnings, at):
-        result['management_warnings'] = warnings
-        for kind, detail in events:
-            result['alerts_created'].append(new_event(state, kind, detail, at))
-        if closed is not None:
-            state['history'] = (state['history'] + [closed])[-cfg.max_state_history :]
-            state['last_exit'] = {
-                'at': closed['closed_at'],
-                'direction': closed['direction'],
-                'id': closed['id'],
-                'reason': closed['exit_reason'],
-            }
-        state['position'] = position
-        result['position_locked'] = position is not None
-        result['decision'] = 'POSITION_CLOSED' if closed else 'POSITION_OPEN'
-        result['reason'] = (
-            closed['exit_reason'] if closed else 'REFERENCE_POSITION_MANAGED'
-        )
+        return result, clock.samples
 
     deadline = day_time(now, *HARD_EXIT)
     if active and timestamp(active['opened_at']).date() < now.date():
@@ -2569,26 +2840,33 @@ def scan(
                 source=closed['exit_source'],
             ),
         )
-        save_position(None, [event], closed, [], at=now)
-        return result, times
-    if not active and now >= deadline:
-        return no_trade('AFTER_SESSION_EXIT_CUTOFF')
+        add_position_events(state, result, cfg, None, [event], closed, [], now)
+        return result, clock.samples
+
+    if now >= deadline and not active:
+        return finish('AFTER_SESSION_EXIT_CUTOFF')
     try:
         session = api.session(now)
     except (DataError, ProviderError) as exc:
         session = None
         result['session_failure'] = str(exc)
+    now = clock()
     if not session:
         if active and now >= deadline:
-            save_position(
-                *manage_reference(active, [], None, now, deadline, cfg), at=now
+            add_position_events(
+                state,
+                result,
+                cfg,
+                *manage_reference(active, [], None, now, deadline, cfg),
+                now,
             )
-            return result, times
+            return result, clock.samples
         if active:
             result['decision'] = 'POSITION_MONITORING_UNAVAILABLE'
-        return no_trade('NO_VERIFIED_NFO_SESSION')
+        return finish('NO_VERIFIED_NFO_SESSION')
     session_open, session_close = session
     deadline = min(deadline, session_close)
+
     price = ClosedPrice([])
     if engine.get('closed_candles'):
         try:
@@ -2597,459 +2875,291 @@ def scan(
             )
         except DataError as exc:
             result['candle_cache_error'] = str(exc)
+    price = capture_price(price, api, clock, session, cfg, result)
+    contracts, window = (
+        capture_oi(api, engine, clock, cfg, result)
+        if clock.last < deadline
+        else ([], None)
+    )
+    expected = exact_minute(clock.last - timedelta(seconds=cfg.feed_grace_seconds))
+    if price.through != expected and clock.last + timedelta(seconds=8) < deadline:
+        price = capture_price(price, api, clock, session, cfg, result)
+    engine['closed_candles'] = [serialize_bar(b) for b in price.bars]
+    if window:
+        result['oi']['candle_through_at_decision'] = (
+            price.through.isoformat() if price.through else None
+        )
 
-    def price_slot(at: datetime) -> datetime:
-        return exact_minute(at - timedelta(seconds=cfg.feed_grace_seconds))
-
-    def refresh_price(error_field: str):
-        nonlocal now, price
-        try:
-            raw = api.candles()
-        except (DataError, ProviderError) as exc:
-            now = clock()
-            result[error_field] = str(exc)
-            return
-        now = clock()
-        try:
-            price = merge_closed_price(price, raw, now, session, cfg)
-        except DataError as exc:
-            result[error_field] = str(exc)
-
-    refresh_price('candle_error')
-    result['candle_coverage'] = price.audit(price_slot(now))
-    engine['closed_candles'] = [serialize_bar(bar) for bar in price.bars]
-
-    early_baseline = session_open
-    if not active and now < early_baseline:
-        return no_trade('BEFORE_FIRST_OI_BASELINE')
-    window = None
-    contracts: list[dict] = []
-    # Index candles and OI have independent publication and receipt times.
-    # Stamp each snapshot at receipt, even if a candle or a network call crossed a minute.
-    slot = price_slot(now)
-    if now < deadline and slot >= early_baseline:
-        try:
-            expiry, contracts = api.contracts(now.date())
-            chain = api.chain(expiry, contracts)
-            now = clock()
-            slot = price_slot(now)
-            if now >= deadline:
-                result['oi'] = {'status': 'CAPTURE_AFTER_SESSION_EXIT_CUTOFF'}
-            else:
-                sample = make_oi_snapshot(chain, expiry, now, slot)
-                ring = engine['oi_samples']
-                window = match_oi(ring, sample, cfg)
-                ring = [s for s in ring if now - timestamp(s['at']) < 15 * MINUTE]
-                if not any(
-                    s['through'] == slot.isoformat() and s['expiry'] == expiry
-                    for s in ring
-                ):
-                    ring.append(jsonable(asdict(sample)))
-                engine['oi_samples'] = ring[-8:]
-                result['oi'] = {
-                    'status': 'MATCHED' if window else 'OI_WINDOW_UNAVAILABLE',
-                    'at': now.isoformat(),
-                    'through': slot.isoformat(),
-                    'candle_through_at_capture': price.through.isoformat()
-                    if price.through
-                    else None,
-                    'expiry': expiry,
-                    'baseline': window.baseline.isoformat() if window else None,
-                    'matched_contracts': len(window.changes) if window else 0,
-                }
-        except (DataError, ProviderError, ValueError, KeyError, TypeError) as exc:
-            now = clock()
-            result['oi'] = {'status': 'OPTION_CHAIN_UNAVAILABLE', 'reason': str(exc)}
-
-    if window is None:
-        slot = price_slot(now)
-    repolled = False
-    slot_ends = slot + MINUTE + timedelta(seconds=cfg.feed_grace_seconds)
-    if (
-        price.through != slot
-        and price_slot(now) == slot
-        and now + CANDLE_REFRESH_REQUEST_BUDGET < min(slot_ends, deadline)
-    ):
-        # The chain request already gave the feed time to publish. Use one
-        # opportunistic refresh, then work from the available closed evidence.
-        refresh_price('candle_repoll_error')
-        repolled = True
-        engine['closed_candles'] = [serialize_bar(bar) for bar in price.bars]
-    bars = price.bars
-    through = price.through
-    entry_slot = slot if window is not None else price_slot(now)
-    result['candle_coverage'] = price.audit(entry_slot)
-    if repolled:
-        result['candle_coverage']['recovered_on_repoll'] = through == entry_slot
-
-    spot = None
-    quote_time = None
+    spot = quote_at = None
     try:
         quotes = api.quotes([INDEX])
         now = clock()
         quote = quotes.get(INDEX)
         spot = checked_quote(quote, now, cfg.quote_max_age_seconds)
-        quote_time = timestamp(quote['timestamp'])
+        quote_at = timestamp(quote['timestamp'])
     except (DataError, ProviderError, KeyError) as exc:
         now = clock()
         result['quote_error'] = str(exc)
 
-    prior_ten = prior_context(engine, api, now) if bars else []
+    prior_ten = prior_context(engine, api, now) if price.bars else []
     now = clock()
+    expected = exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds))
+    result['candle_coverage'] = price.audit(expected)
     if (
         window is not None
         and (now - window.snapshot.at).total_seconds() > cfg.quote_max_age_seconds
     ):
         result['oi']['status'] = 'STALE_AT_DECISION'
         window = None
-    ctx = analyze_price(bars, prior_ten, session_open) if bars else None
+    if (
+        quote_at is not None
+        and (now - quote_at).total_seconds() > cfg.quote_max_age_seconds
+    ):
+        spot = quote_at = None
+    ctx = analyze_price(price.bars, prior_ten, session_open) if price.bars else None
     grid = listed_strikes(contracts)
     pairs = paired_oi(window)
     band = StrikeBand.build(grid, spot, pairs) if spot is not None else None
     if ctx:
+        region = ctx.live_range(spot)
         result['market_assessment'] = {
-            **ctx.public(band),
+            'state': ctx.regime(band, spot),
+            'through': ctx.through.isoformat(),
             'spot': spot,
-            'index_quote_at': quote_time.isoformat() if quote_time else None,
+            'index_quote_at': quote_at.isoformat() if quote_at else None,
+            'trend': ctx.trend,
+            'protected': jsonable(asdict(ctx.protected)) if ctx.protected else None,
+            'range': [region.low, region.high] if region else None,
+            'range_break_not_held_live': region is not None
+            and ctx.trading_range is None,
+            'transition': jsonable(asdict(ctx.transition)) if ctx.transition else None,
+            'reversal_watch': ctx.reversal_watch(),
+            'close_3m': ctx.threes[-1].close if ctx.threes else None,
+            'close_3m_at': bar_end(ctx.threes[-1], 3).isoformat()
+            if ctx.threes
+            else None,
+            'move_3m': ctx.move,
+            'acceleration_3m': ctx.acceleration,
+            'atr_1m': ctx.atr,
+            'atr_3m': ctx.atr3,
             'strike_band': band.public() if band else None,
         }
-        watches = result['market_assessment']['reversal_watches'] = []
-        for side in (1, -1):
-            pattern = ctx.patterns.get(side)
-            recent = ctx.bars[-4:]
-            if pattern is not None and ctx.trend == -side:
-                levels = [
-                    level for level in grid if side * (level - pattern.neckline) > 0
-                ]
-                first = nearest_strike(levels, pattern.neckline) if levels else None
-                watches.append(
-                    {
-                        'side': side,
-                        'pattern': jsonable(asdict(pattern)),
-                        'protected': ctx.protected,
-                        'first_listed_level': first,
-                        'first_listed_level_already_passed': (
-                            first is not None
-                            and spot is not None
-                            and side * (spot - first) >= 0
-                        ),
-                        'reason': 'OPPOSING_PROTECTED_STRUCTURE_INTACT',
-                    }
-                )
-            elif ctx.trend == -side and len(recent) >= 2:
-                edge = (
-                    min(b.low for b in recent)
-                    if side == 1
-                    else max(b.high for b in recent)
-                )
-                if side * (recent[-1].close - edge) >= max(8.0, 0.75 * ctx.atr) and (
-                    side * (recent[-1].close - recent[-2].close) > 0
-                ):
-                    watches.append(
-                        {
-                            'side': side,
-                            'extreme': edge,
-                            'protected': ctx.protected,
-                            'reason': 'OBSERVE_BOUNCE_OR_REJECTION',
-                        }
-                    )
 
-    if active is not None:
-        managed, events, closed, warnings = manage_reference(
+    if active:
+        position, events, closed, warnings = manage_reference(
             active,
-            bars,
+            price.bars,
             spot,
             now,
             deadline,
             cfg,
-            spot_at=quote_time,
+            spot_at=quote_at,
             session_open=session_open,
         )
-        has_fresh_spot = (
-            spot is not None
-            and quote_time is not None
-            and (now - quote_time).total_seconds() <= cfg.quote_max_age_seconds
-        )
         if (
-            managed
+            position
             and ctx
-            and has_fresh_spot
+            and spot is not None
             and now < deadline
-            and price.covers_entry(price_slot(now))
+            and price.covers_entry(expected)
         ):
-            adjustment = refine_reference(managed, ctx, spot, band, now)
+            adjustment = refine_reference(position, ctx, spot, band, now)
             if adjustment:
-                t1_event = next(
-                    (detail for kind, detail in events if kind == 'T1'), None
-                )
-                if t1_event:
-                    t1_event['adjustment_at'] = now.isoformat()
-                    t1_event['new_stop'] = managed['stop']
-                    t1_event['position'].update(
-                        stop=managed['stop'],
-                        t2=managed['t2'],
-                        t2_source=managed['t2_source'],
+                t1 = next((detail for kind, detail in events if kind == 'T1'), None)
+                if t1:
+                    t1['adjustment_at'] = now.isoformat()
+                    t1['new_stop'] = position['stop']
+                    t1['position'].update(
+                        stop=position['stop'],
+                        t2=position['t2'],
+                        t2_source=position['t2_source'],
                     )
-                    t1_event['email_observation'].update(
-                        stop=managed['stop'], t2=managed['t2']
+                    t1['email_observation'].update(
+                        stop=position['stop'], t2=position['t2']
                     )
                 else:
                     events.append(adjustment)
-        save_position(managed, events, closed, warnings, at=now)
-        if managed and spot is None and not bars:
+        add_position_events(state, result, cfg, position, events, closed, warnings, now)
+        if position and spot is None and not price.bars:
             result.update(
                 decision='POSITION_MONITORING_UNAVAILABLE',
                 reason='PRICE_FEED_UNAVAILABLE',
             )
 
-    if ctx is None:
-        return no_trade('NO_COMPLETED_SESSION_CANDLES')
+    if not ctx:
+        return finish('NO_COMPLETED_SESSION_CANDLES')
+    candidate = ctx.setup
+    if candidate:
+        result['candidate'] = jsonable(asdict(candidate)) | {
+            'identity': candidate.identity
+        }
+
+    # Record expired or structurally replaced opportunities. Incomplete data
+    # never resolves a price setup before its original deadline.
+    enough_price = price.covers_entry(expected) and price.tail_size >= 6
+    ledger = engine.get('v137_setups', {})
+    for key, old in ledger.items():
+        if old['status'] in TERMINAL_SETUP_STATES:
+            continue
+        if now > timestamp(old['expires_at']):
+            old.update(status='EXPIRED', reason='SETUP_EXPIRED', at=now.isoformat())
+        elif enough_price and (not candidate or key != candidate.identity):
+            old.update(
+                status='INVALIDATED',
+                reason='MARKET_STRUCTURE_REPLACED',
+                at=now.isoformat(),
+            )
+
     if now < max(day_time(now, *ENTRY_START), session_open + 6 * MINUTE):
-        return no_trade('COLLECTING_OPENING_BASELINE')
-    if not price.covers_entry(entry_slot):
-        return no_trade('CLOSED_PRICE_TOO_OLD_FOR_ENTRY')
-    if price.tail_size < 6:
-        return no_trade('INSUFFICIENT_CONTIGUOUS_PRICE_HISTORY')
-
-    earliest = entry_slot - MAX_TRIGGER_AGE - timedelta(seconds=1)
-    previous = engine.get('evaluated_through')
-    since = max(earliest, timestamp(previous)) if previous else earliest
-    engine['evaluated_through'] = max(through, since).isoformat()
-    if (
-        window is None
-        or (now - window.snapshot.at).total_seconds() > cfg.quote_max_age_seconds
-    ):
-        return no_trade('OI_WINDOW_UNAVAILABLE_OR_STALE')
-    if price_slot(now) != entry_slot:
-        return no_trade('PRICE_WINDOW_ROLLED_DURING_SNAPSHOT')
-    if (
-        quote_time is None
-        or quote_time < entry_slot
-        or (now - quote_time).total_seconds() > cfg.quote_max_age_seconds
-    ):
-        return no_trade('INDEX_QUOTE_UNAVAILABLE_FOR_ENTRY')
-    if band is None:
-        return no_trade('ATM_STRIKE_BAND_UNAVAILABLE')
-
-    result['entry_evidence'] = {
-        'index_quote_at': quote_time.isoformat(),
-        'index_quote': spot,
-        'decision_through': entry_slot.isoformat(),
-        'candle_through': through.isoformat(),
-        'latest_candle_close': ctx.bars[-1].close,
-        'initial_atm': band.atm,
-    }
-    consumed = engine['consumed_signals']
-    decisions, setups = evaluate_setups(
-        ctx, spot, grid, pairs, window, cfg, since, entry_slot, consumed
-    )
-    result['evaluations'] = decisions
-    if ctx.bounds is not None:
-        return no_trade('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD')
-    if state.get('position') is not None:
-        return no_trade('EXISTING_POSITION_REMAINS_VALID')
-    last_entry = min(day_time(now, *ENTRY_END), deadline - 10 * MINUTE)
-    if now >= last_entry:
-        return no_trade('OUTSIDE_ENTRY_WINDOW')
-    if not setups:
-        return no_trade(
-            'NO_QUALIFIED_PRICE_OI_AND_RISK_SETUP'
-            if decisions
-            else 'NO_FRESH_PRICE_TRIGGER'
+        return finish('COLLECTING_OPENING_BASELINE', 'WATCHING', candidate)
+    if not enough_price:
+        return finish(
+            'CLOSED_PRICE_UNAVAILABLE_FOR_ENTRY',
+            'WAITING_CONFIRMATION'
+            if candidate
+            and ledger.get(candidate.identity, {}).get('status')
+            not in TERMINAL_SETUP_STATES
+            else None,
+            candidate,
         )
-    last_exit = state.get('last_exit')
-    if last_exit:
-        checks = [
-            post_exit_entry_check(setup.signal, ctx, spot, last_exit, state['history'])
-            for setup in setups
-        ]
-        result['reentry_checks'] = checks
-        setups = [
-            setup
-            for setup, check in zip(setups, checks)
-            if check['reason'] == 'QUALIFIED'
-        ]
-        if not setups:
-            return no_trade(checks[0]['reason'])
-    if len({setup.signal.side for setup in setups}) != 1:
-        return no_trade('CONFLICTING_QUALIFIED_DIRECTIONS')
+    if state.get('position'):
+        return finish('EXISTING_POSITION_REMAINS_VALID')
+    if ctx.trading_range:
+        return finish('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD')
+    if not candidate:
+        reason = (
+            'REVERSAL_WATCH_AWAITING_CONFIRMATION'
+            if ctx.transition or ctx.reversal_watch()
+            else 'NO_CONFIRMED_NEW_LEG'
+        )
+        return finish(reason)
+
+    setup = candidate
+    last_entry = min(day_time(now, *ENTRY_END), deadline - 10 * MINUTE)
+    existing = ledger.get(setup.identity, {})
+    if existing.get('status') in TERMINAL_SETUP_STATES:
+        result['setup'] = existing
+        return finish(existing['reason'])
+    if now > setup.expires_at or now >= last_entry:
+        return finish(
+            'SETUP_EXPIRED' if now > setup.expires_at else 'OUTSIDE_ENTRY_WINDOW',
+            'EXPIRED',
+            setup,
+        )
+    if window is None:
+        return finish('OI_WINDOW_UNAVAILABLE_OR_STALE', 'WAITING_CONFIRMATION', setup)
+    if spot is None or quote_at is None or quote_at < setup.confirmed_at:
+        return finish(
+            'INDEX_QUOTE_UNAVAILABLE_FOR_ENTRY', 'WAITING_CONFIRMATION', setup
+        )
+    if band is None:
+        return finish('ATM_STRIKE_BAND_UNAVAILABLE', 'WAITING_CONFIRMATION', setup)
 
     listed = {
         (row['instrument_type'], float(row['strike_price'])): row
         for row in contracts
         if row['expiry'] == window.snapshot.expiry
     }
-    center = grid.index(band.atm)
-    adjacent = grid[max(0, center - 1) : center + 2]
-    request_keys = []
-    for value in adjacent:
-        candidate_band = StrikeBand.build(grid, value, pairs)
-        for setup in setups:
-            request_keys.extend(
-                row['instrument_key']
-                for _, _, row, _ in directional_contracts(candidate_band, setup, listed)
-            )
-    if not request_keys:
-        return no_trade('NO_DIRECTIONAL_OI_AT_ELIGIBLE_OFFSETS')
+    initial = assess_entry(setup, ctx, state, spot, window, grid, band, listed, cfg)
+    result['evaluations'].append(
+        {'phase': 'INITIAL', 'reason': initial.reason, **initial.evidence}
+    )
+    if initial.plan is None:
+        return finish(initial.reason, initial.status, setup)
+
+    allowed_atms, keys = entry_quote_candidates(setup, grid, band, pairs, listed)
     try:
-        option_quotes = api.quotes([INDEX, *dict.fromkeys(request_keys)])
+        quotes = api.quotes([INDEX, *keys])
         now = clock()
-        index_quote = option_quotes.get(INDEX)
-        final_spot = checked_quote(index_quote, now, cfg.quote_max_age_seconds)
-        final_at = timestamp(index_quote['timestamp'])
+        underlying = quotes.get(INDEX)
+        final_spot = checked_quote(underlying, now, cfg.quote_max_age_seconds)
+        final_at = timestamp(underlying['timestamp'])
     except (DataError, ProviderError, KeyError) as exc:
         result['option_quote_error'] = str(exc)
-        return no_trade('ENTRY_QUOTE_REQUEST_FAILED')
+        return finish('ENTRY_QUOTE_REQUEST_FAILED', 'WAITING_CONFIRMATION', setup)
+    if now > setup.expires_at or now >= last_entry:
+        return finish('SETUP_EXPIRED_DURING_QUOTE_FETCH', 'EXPIRED', setup)
     if (
-        now >= last_entry
-        or price_slot(now) != entry_slot
-        or final_at < max(entry_slot, quote_time)
+        final_at < quote_at
+        or final_at < setup.confirmed_at
         or (now - window.snapshot.at).total_seconds() > cfg.quote_max_age_seconds
+        or not price.covers_entry(
+            exact_minute(now - timedelta(seconds=cfg.feed_grace_seconds))
+        )
     ):
-        return no_trade('DECISION_WINDOW_EXPIRED_DURING_QUOTE_FETCH')
+        return finish(
+            'FINAL_MARKET_EVIDENCE_NOT_COHERENT', 'WAITING_CONFIRMATION', setup
+        )
 
     final_band = StrikeBand.build(grid, final_spot, pairs)
-    if final_band is None or final_band.atm not in adjacent:
-        return no_trade('ATM_CHANGED_BEYOND_REQUESTED_STRIKE_BANDS')
-    result['entry_evidence'].update(
-        index_quote_at=final_at.isoformat(),
-        index_quote=final_spot,
-        final_atm=final_band.atm,
+    if final_band is None or final_band.atm not in allowed_atms:
+        return finish(
+            'ATM_CHANGED_BEYOND_REQUESTED_STRIKE_BANDS', 'WAITING_CONFIRMATION', setup
+        )
+    final = assess_entry(
+        setup, ctx, state, final_spot, window, grid, final_band, listed, cfg
     )
-    final_checks, final_setups = evaluate_setups(
-        ctx, final_spot, grid, pairs, window, cfg, since, entry_slot, consumed
+    result['evaluations'].append(
+        {'phase': 'FINAL', 'reason': final.reason, **final.evidence}
     )
-    wanted = {setup.signal.identity for setup in setups}
-    result['final_evaluations'] = [
-        check for check in final_checks if check['identity'] in wanted
-    ]
-    final_setups = [setup for setup in final_setups if setup.signal.identity in wanted]
-    if not final_setups:
-        return no_trade('FINAL_LIVE_PRICE_INVALIDATES_SETUP')
-    if last_exit:
-        checks = [
-            post_exit_entry_check(
-                setup.signal, ctx, final_spot, last_exit, state['history']
-            )
-            for setup in final_setups
-        ]
-        result['final_reentry_checks'] = checks
-        final_setups = [
-            setup
-            for setup, check in zip(final_setups, checks)
-            if check['reason'] == 'QUALIFIED'
-        ]
-        if not final_setups:
-            return no_trade(checks[0]['reason'])
+    if final.plan is None:
+        return finish(final.reason, final.status, setup)
 
+    ranked = []
     result['contract_checks'] = []
-    for setup in final_setups:
-        signal, plan = setup.signal, setup.plan
-        ranked = []
-        for offset, pair, row, rule in directional_contracts(final_band, setup, listed):
-            key = row['instrument_key']
-            check = {
-                'strike': pair.strike,
-                'oi_rule': rule,
-                'oi_pair': pair.public(),
-                'trigger': signal.identity,
-            }
-            result['contract_checks'].append(check)
-            try:
-                contract = live_contract(
-                    row, option_quotes.get(key), now, final_at, final_band, offset, cfg
-                )
-            except (DataError, KeyError, ValueError, TypeError) as exc:
-                check['reason'] = str(exc)
-                continue
-            check['reason'] = 'QUALIFIED_QUOTE'
-            contract['oi_rule'] = rule
-            ranked.append(
-                (
-                    -pair.score(signal.side),
-                    contract['spread_pct'],
-                    -contract['depth_lots'],
-                    abs(offset),
-                    key,
-                    contract,
-                )
-            )
-        if not ranked:
-            continue
-        *_, key, contract = min(ranked, key=lambda row: row[:-1])
-        direction = 'BULLISH' if signal.side == 1 else 'BEARISH'
-        position_id = hashlib.sha256(
-            f'{now.date()}|{signal.identity}|{key}'.encode()
-        ).hexdigest()[:22]
-        position = {
-            'id': position_id,
-            'status': 'OPEN',
-            'direction': direction,
-            'side': contract['side'],
-            'strike': contract['strike'],
-            'expiry': contract['expiry'],
-            'instrument_key': key,
-            'opened_at': now.isoformat(),
-            'entry_spot': final_spot,
-            'entry_ask': contract['ask'],
-            'initial_stop': plan.stop,
-            'setup_level': signal.trigger,
-            'setup_invalidation': plan.stop,
-            'last_candle': bars[-1].start.isoformat(),
-            'scenario': signal.kind,
-            't1_hit': False,
-            'remaining_pct': 100,
-            'contract': contract,
-            **asdict(plan),
+    for offset, pair, row, rule in final.choices:
+        check = {
+            'strike': pair.strike,
+            'offset': offset,
+            'oi_rule': rule,
+            'oi_pair': pair.public(),
         }
-        if (
-            cfg.arm_continuation_runner
-            and not signal.reversal
-            and signal.kind != 'RANGE_BREAK_HOLD'
-            and ctx.move is not None
-            and signal.side * ctx.move >= STRONG_MOVE
-            and setup.rule == 'STANDARD_2_PERCENT'
-            and runner_price_support(ctx.threes, signal.side)
-        ):
-            position['runner'] = {'checkpoint': plan.t2, 'armed_at': now.isoformat()}
+        result['contract_checks'].append(check)
+        try:
+            contract = live_contract(
+                row,
+                quotes.get(row['instrument_key']),
+                now,
+                final_at,
+                final_band,
+                offset,
+                cfg,
+            )
+        except (DataError, KeyError, ValueError, TypeError) as exc:
+            check['reason'] = str(exc)
+            continue
+        check['reason'] = 'QUALIFIED_QUOTE'
+        contract['oi_rule'] = rule
+        ranked.append(
+            (
+                -pair.score(setup.side),
+                contract['spread_pct'],
+                -contract['depth_lots'],
+                abs(offset),
+                contract['instrument_key'],
+                contract,
+            )
+        )
+    if not ranked:
+        return finish(
+            'DIRECTIONAL_OPTION_QUOTES_UNAVAILABLE', 'WAITING_CONFIRMATION', setup
+        )
 
-        state['position'] = position
-        engine['last_entry_through'] = through.isoformat()
-        engine['consumed_signals'] = (consumed + [signal.identity])[-160:]
-        evidence = result['entry_evidence']
-        evidence.update(
-            signal_candle_closed_at=signal.at.isoformat(),
-            option_quote_at=contract['quote_time'],
-        )
-        event = position_event_payload(
-            position,
-            now,
-            reason='QUALIFIED_PRICE_AND_3M_OI',
-            signal=jsonable(asdict(signal)),
-            plan=asdict(plan),
-            entry_evidence=evidence,
-            risk_evidence=setup.risk,
-            oi={
-                'window': result['oi'],
-                'confirmation_pair': setup.pair.public(),
-                'rule': setup.rule,
-            },
-        )
-        result['alerts_created'].append(new_event(state, 'ENTRY', event, now))
-        result.update(
-            decision='ENTRY',
-            reason='QUALIFIED_' + contract['side'],
-            position_locked=True,
-            selected_position=position,
-            final_risk_evidence=setup.risk,
-        )
-        return result, times
-    reason = (
-        'DIRECTIONAL_OPTION_QUOTES_UNAVAILABLE'
-        if result['contract_checks']
-        else 'NO_DIRECTIONAL_OI_AT_FINAL_ATM'
+    contract = min(ranked, key=lambda row: row[:-1])[-1]
+    result['entry_evidence'] = {
+        'initial_atm': band.atm,
+        'final_atm': final_band.atm,
+        'index_quote_at': final_at.isoformat(),
+        'index_quote': final_spot,
+        'signal_candle_closed_at': setup.confirmed_at.isoformat(),
+        'option_quote_at': contract['quote_time'],
+        'candle_through': ctx.through.isoformat(),
+        'oi_snapshot_at': window.snapshot.at.isoformat(),
+    }
+    open_position(
+        state, engine, result, setup, final, ctx, window, contract, final_spot, now, cfg
     )
-    return no_trade(reason)
+    return result, clock.samples
 
 
 def email_price(value: Any, pattern: str) -> str:
@@ -3109,6 +3219,10 @@ def mail_content(event: dict) -> tuple[str, str]:
             'SESSION_REFERENCE_EXIT': ('Session exit', 'Session exit'),
             'PRIOR_SESSION_REFERENCE_EXPIRED': ('Session exit', 'Session exit'),
             'CONFIRMED_ZONE_REVERSAL': ('Reversal exit', 'Reversal exit'),
+            'RUNNER_CONTINUATION_NOT_CONFIRMED': (
+                'Runner exit',
+                'Runner continuation unconfirmed',
+            ),
         }.get(reason, ('Exit', 'Exited'))
     elif kind == 'ADJUST_SL':
         status = (
@@ -3266,12 +3380,12 @@ def environment_config() -> Config:
         'max_unretested_leg_atr',
         'cooldown_minutes',
         'allow_atm_reversal',
+        'reversal_strike_stop',
+        'max_chase_atr',
     ):
         raw.pop(legacy, None)
     # v133 stored these values as defaults in some deployed configurations.
     # Explicit non-default overrides still apply.
-    if raw.get('max_chase_atr') == 1.25:
-        raw.pop('max_chase_atr')
     if raw.get('min_reward_risk') == 1.25:
         raw.pop('min_reward_risk')
     if 't1_min_reward_risk' in raw:
