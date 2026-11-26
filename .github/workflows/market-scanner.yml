@@ -1,4 +1,4 @@
-name: NIFTY scanner v137.1.1 (3-minute Cloudflare dispatch)
+name: NIFTY scanner v138 (3-minute Cloudflare dispatch)
 
 # NO GitHub cron: keep the existing Cloudflare Worker and its 3-minute cadence.
 # Supports workflow_dispatch (the previous integration) plus optional repository_dispatch.
@@ -10,7 +10,7 @@ on:
         type: choice
         required: true
         default: scan
-        options: [scan, initialize_flat, migrate_state, reconcile_flat, requeue_alert]
+        options: [scan, shadow_scan, initialize_flat, migrate_state, reconcile_flat, requeue_alert]
       source_state:
         description: "Existing repo state path for migrate_state (only when destination absent)"
         type: string
@@ -39,8 +39,9 @@ jobs:
     timeout-minutes: 12
     environment: Production
     env:
-      STATE_FILE: state/market_state_v120_3.json
-      AUDIT_DIR: audit
+      STATE_FILE: ${{ (inputs.operation == 'shadow_scan' || vars.NIFTY_V138_SHADOW == '1') && 'state/market_state_v138_shadow.json' || 'state/market_state_v120_3.json' }}
+      AUDIT_DIR: ${{ (inputs.operation == 'shadow_scan' || vars.NIFTY_V138_SHADOW == '1') && 'audit/v138_shadow' || 'audit' }}
+      NIFTY_V138_SHADOW: ${{ (inputs.operation == 'shadow_scan' || vars.NIFTY_V138_SHADOW == '1') && '1' || '0' }}
       NIFTY_SCANNER_CONFIG: ${{ vars.NIFTY_SCANNER_CONFIG }}
       NOTIFICATION_CLAIM_TOKEN: ${{ github.run_id }}:${{ github.run_attempt }}
     steps:
@@ -72,7 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(python market_scanner.py --version)" = "137.1.1"
+          test "$(python market_scanner.py --version)" = "138.0.0"
           python -m py_compile market_scanner.py
 
       - name: Initialize only after manual verified flat-state selection
@@ -115,7 +116,7 @@ jobs:
 
       - name: Scan closed candles, match 3-minute OI, and claim actionable alerts
         id: scan_run
-        if: ${{ github.event_name == 'repository_dispatch' || inputs.operation == 'scan' }}
+        if: ${{ github.event_name == 'repository_dispatch' || inputs.operation == 'scan' || inputs.operation == 'shadow_scan' }}
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
         shell: bash
@@ -136,16 +137,16 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if [[ -f "$STATE_FILE" ]]; then git add -f -- "$STATE_FILE"; fi
           shopt -s nullglob
-          audits=(audit/market_scan_v137_1_1_*.jsonl)
+          audits=("$AUDIT_DIR"/market_scan_v138_*.jsonl)
           if (( ${#audits[@]} )); then git add -f -- "${audits[@]}"; fi
-          if [[ -d audit/inputs_v137_1_1 ]]; then git add -f -- audit/inputs_v137_1_1; fi
+          if [[ -d "$AUDIT_DIR/inputs_v138" ]]; then git add -f -- "$AUDIT_DIR/inputs_v138"; fi
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || {
               echo 'Concurrent branch update: refusing rebase of authoritative trading state' >&2
               exit 1
             }
-            git commit -m 'Persist v137.1.1 market evidence, position state and email claims'
+            git commit -m 'Persist v138 market evidence, position state and email claims'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
 
@@ -153,7 +154,7 @@ jobs:
       # BEFORE the first SMTP socket. A crash cannot create automatic duplicate mail.
       - name: Arm actionable email events, without connecting to SMTP
         id: arm
-        if: ${{ always() && steps.persist_scan.outcome == 'success' && (github.event_name == 'repository_dispatch' || inputs.operation == 'scan') }}
+        if: ${{ always() && env.NIFTY_V138_SHADOW != '1' && steps.persist_scan.outcome == 'success' && (github.event_name == 'repository_dispatch' || inputs.operation == 'scan') }}
         run: python market_scanner.py --arm-delivery
 
       - name: Persist armed SMTP uncertainty BEFORE sending
@@ -168,7 +169,7 @@ jobs:
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
-            git commit -m 'Arm v137.1.1 SMTP events durably before network I/O'
+            git commit -m 'Arm v138 SMTP events durably before network I/O'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
 
@@ -197,6 +198,6 @@ jobs:
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
-            git commit -m 'Persist v137.1.1 SMTP accepted/uncertain outcomes'
+            git commit -m 'Persist v138 SMTP accepted/uncertain outcomes'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
