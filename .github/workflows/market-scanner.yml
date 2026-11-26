@@ -1,4 +1,4 @@
-name: NIFTY scanner v137.1 (3-minute Cloudflare dispatch)
+name: NIFTY scanner v137.1.1 (3-minute Cloudflare dispatch)
 
 # NO GitHub cron: keep the existing Cloudflare Worker and its 3-minute cadence.
 # Supports workflow_dispatch (the previous integration) plus optional repository_dispatch.
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(python market_scanner.py --version)" = "137.1.0"
+          test "$(python market_scanner.py --version)" = "137.1.1"
           python -m py_compile market_scanner.py
 
       - name: Initialize only after manual verified flat-state selection
@@ -136,16 +136,16 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if [[ -f "$STATE_FILE" ]]; then git add -f -- "$STATE_FILE"; fi
           shopt -s nullglob
-          audits=(audit/market_scan_v137_1_*.jsonl)
+          audits=(audit/market_scan_v137_1_1_*.jsonl)
           if (( ${#audits[@]} )); then git add -f -- "${audits[@]}"; fi
-          if [[ -d audit/inputs_v137_1 ]]; then git add -f -- audit/inputs_v137_1; fi
+          if [[ -d audit/inputs_v137_1_1 ]]; then git add -f -- audit/inputs_v137_1_1; fi
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || {
               echo 'Concurrent branch update: refusing rebase of authoritative trading state' >&2
               exit 1
             }
-            git commit -m 'Persist v137.1 market evidence, position state and email claims'
+            git commit -m 'Persist v137.1.1 market evidence, position state and email claims'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
 
@@ -168,7 +168,7 @@ jobs:
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
-            git commit -m 'Arm v137.1 SMTP events durably before network I/O'
+            git commit -m 'Arm v137.1.1 SMTP events durably before network I/O'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
 
@@ -197,6 +197,6 @@ jobs:
           if ! git diff --cached --quiet; then
             git fetch origin "$DEFAULT_BRANCH"
             test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" || exit 1
-            git commit -m 'Persist v137.1 SMTP accepted/uncertain outcomes'
+            git commit -m 'Persist v137.1.1 SMTP accepted/uncertain outcomes'
             git push origin "HEAD:${DEFAULT_BRANCH}"
           fi
