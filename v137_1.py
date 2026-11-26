@@ -32,8 +32,8 @@ from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-VERSION = '137.1.0'
-AUDIT_RELEASE = 'v137_1'
+VERSION = '137.1.1'
+AUDIT_RELEASE = 'v137_1_1'
 IST = timezone(timedelta(hours=5, minutes=30))
 INDEX = 'NSE_INDEX|Nifty 50'
 ALERT_KINDS = frozenset({'ENTRY', 'EXIT', 'ADJUST_SL', 'T1', 'T2'})
@@ -1244,15 +1244,11 @@ def prior_context(engine: dict, api, now: datetime) -> list[Candle]:
 MINUTE = timedelta(minutes=1)
 DISPATCH_INTERVAL = 3 * MINUTE
 MAX_ENTRY_CANDLE_LAG = MINUTE
-MAX_TRIGGER_AGE = DISPATCH_INTERVAL + MAX_ENTRY_CANDLE_LAG
 OI_LEVEL_MATERIAL_CHANGE = 0.02
 EARLY_RETEST_OI_CHANGE = 0.019
 T1_SPOT_BAND = (45.0, 50.0)
 T2_SPOT_BAND = (80.0, 90.0)
 STRONG_MOVE = 15.0
-MIN_STOP_POINTS = 3.0
-MIN_STOP_ATR_FRACTION = 0.45
-CONTAINMENT_MINUTES = 18
 STOP_REENTRY_LOOKBACK = 15
 
 
@@ -1268,7 +1264,7 @@ class Config:
     max_state_history: int = 240
     record_inputs: bool = True
     arm_continuation_runner: bool = True
-    max_initial_risk_points: float = 60.0
+    initial_stop_points: float = 25.0
 
     def __post_init__(self):
         flags = (
@@ -1293,6 +1289,8 @@ class Config:
                 or (key in integers and type(value) is not int)
             ):
                 raise DataError(f'Invalid configuration: {key}')
+        if not 20 <= self.initial_stop_points <= 30:
+            raise DataError('Initial stop must be between 20 and 30 NIFTY points')
         if not (
             self.oi_jitter_seconds < 60
             and 1 <= self.feed_grace_seconds < 15
@@ -1333,12 +1331,6 @@ class OIPair:
             self.changes is not None
             and max(map(abs, self.changes)) < EARLY_RETEST_OI_CHANGE
         )
-
-    def score(self, side: int) -> float:
-        if self.changes is None:
-            return 0.0
-        call, put = self.changes
-        return side * (put - call)
 
     def public(self) -> dict:
         if self.changes is None:
@@ -1401,9 +1393,10 @@ class StrikeBand:
         }
 
 
-# Market structure, setup lifecycle and planning.
-EXTREME_CONFIRMATION_AGE = 18 * MINUTE
-OPENING_PHASE = 18 * MINUTE
+# A setup is identified by its first break. Its price evidence can strengthen
+# as subsequent candles close without changing its identity or lifetime.
+DISPATCH_GRACE = timedelta(seconds=90)
+REJECTION_LOOKBACK = 18 * MINUTE
 
 
 def favorable_edge(bar: Candle, side: int) -> float:
@@ -1418,6 +1411,14 @@ def passed(value: float, boundary: float, side: int, margin: float = 0.0) -> boo
     return side * (value - boundary) > margin
 
 
+def held_break(
+    bars: list[Candle], side: int, level: float, margin: float = 0.0
+) -> bool:
+    return len(bars) >= 2 and all(
+        passed(b.close, level, side, margin) for b in bars[-2:]
+    )
+
+
 def confirmed_swing(bars: list[Candle], side: int, duration: int) -> Swing | None:
     if len(bars) < 3:
         return None
@@ -1425,11 +1426,17 @@ def confirmed_swing(bars: list[Candle], side: int, duration: int) -> Swing | Non
     price = protective_edge(center, side)
     if (
         right.start - center.start == center.start - left.start == duration * MINUTE
-        and side * (protective_edge(left, side) - price) > 0
-        and side * (protective_edge(right, side) - price) > 0
+        and passed(protective_edge(left, side), price, side)
+        and passed(protective_edge(right, side), price, side)
     ):
         return Swing(price, center.start, bar_end(right, duration))
     return None
+
+
+def setup_deadline(first_break: datetime, opens: datetime) -> datetime:
+    quotient, remainder = divmod(first_break - opens, DISPATCH_INTERVAL)
+    next_slot = opens + (quotient + bool(remainder) + 1) * DISPATCH_INTERVAL
+    return next_slot + DISPATCH_GRACE
 
 
 @dataclass(frozen=True)
@@ -1437,21 +1444,17 @@ class EntrySetup:
     side: int
     kind: str
     trigger: float
-    stop: Swing
-    oi_level: float
+    invalidation: Swing
+    first_break_at: datetime
     confirmed_at: datetime
     expires_at: datetime
-    leg_anchor: float
-    leg_started_at: datetime
-    trigger_limit: float
-    leg_limit: float
+    chase_limit: float
     defended_at: datetime | None = None
-    break_margin: float = 0.0
+    live_confirmation: bool = False
 
     @property
     def identity(self) -> str:
-        # A defended retest updates evidence for the original opportunity.
-        raw = f'{self.side}|{self.kind}|{self.leg_started_at.isoformat()}|{self.confirmed_at.isoformat()}'
+        raw = f'{self.side}|{self.kind}|{self.first_break_at.isoformat()}'
         return hashlib.sha256(raw.encode()).hexdigest()[:22]
 
 
@@ -1466,29 +1469,13 @@ class TradingRange:
         return self.high if side == 1 else self.low
 
 
-@dataclass(frozen=True)
-class RangeBreak:
-    region: TradingRange
-    setup: EntrySetup
-
-
-@dataclass(frozen=True)
-class Reversal:
-    side: int
-    neckline: float
-    first: Swing
-    second: Swing
-    stop: Swing
-
-
 @dataclass
-class StructureTransition:
-    previous_side: int
-    protection: Swing
-    started_at: datetime
-    pattern: Reversal | None = None
-    expansion_level: float | None = None
-    initial_confirmed: bool = False
+class RangeExit:
+    region: TradingRange
+    side: int
+    opened_at: datetime
+    retest_used: bool = False
+    holding: bool = True
 
 
 @dataclass
@@ -1496,6 +1483,24 @@ class DirectionalLeg:
     side: int
     extreme: Swing
     pullback: Swing | None = None
+
+
+@dataclass(frozen=True)
+class Rejection:
+    side: int
+    first: Swing
+    second: Swing
+    reaction: float
+    origin: datetime
+
+    @property
+    def invalidation(self) -> Swing:
+        return min((self.first, self.second), key=lambda x: self.side * x.price)
+
+    @property
+    def trigger(self) -> float:
+        # A failed second test has retraced at least 60% of its bounce.
+        return self.second.price + 0.60 * (self.reaction - self.second.price)
 
 
 @dataclass(frozen=True)
@@ -1509,11 +1514,11 @@ class PriceContext:
     trend: int
     protected: Swing | None
     trading_range: TradingRange | None
-    transition: StructureTransition | None
     setup: EntrySetup | None
+    rejection: Rejection | None
     move: float | None
     acceleration: float | None
-    released_range: RangeBreak | None = None
+    range_exit: RangeExit | None
 
     @property
     def through(self) -> datetime:
@@ -1522,19 +1527,19 @@ class PriceContext:
     def live_range(self, spot: float | None) -> TradingRange | None:
         if self.trading_range:
             return self.trading_range
-        if self.released_range and spot is not None:
-            breakout = self.released_range.setup
-            defended = (
-                self.setup
-                and self.setup.identity == breakout.identity
-                and self.setup.defended_at
-            )
-            margin = 0.0 if defended else breakout.break_margin
-            if not passed(spot, breakout.trigger, breakout.side, margin):
-                return self.released_range.region
+        released = self.range_exit
+        if released and spot is not None:
+            edge = released.region.edge(released.side)
+            if (
+                not released.holding
+                and released.region.low <= spot <= released.region.high
+                or self.through <= released.opened_at + DISPATCH_INTERVAL
+                and not passed(spot, edge, released.side, released.region.margin)
+            ):
+                return released.region
         return None
 
-    def regime(self, band: StrikeBand | None, spot: float | None = None) -> str:
+    def regime(self, band: StrikeBand | None, spot: float | None) -> str:
         if self.live_range(spot):
             nearby = [band.pairs.get(k) for k in (-2, -1, 1, 2)] if band else []
             if not nearby or any(
@@ -1548,564 +1553,476 @@ class PriceContext:
                 and max(abs(self.move), abs(self.acceleration)) < STRONG_MOVE
             )
             return 'SIDEWAYS' if quiet and weak else 'MIXED_RANGE'
-        if self.transition:
-            side = self.transition.previous_side
-            if self.transition.initial_confirmed:
-                return 'BULLISH_TO_BEARISH' if side == 1 else 'BEARISH_TO_BULLISH'
-            return 'TRANSITION_FROM_BULLISH' if side == 1 else 'TRANSITION_FROM_BEARISH'
+        if (
+            self.setup
+            and self.setup.kind == 'REVERSAL'
+            and self.through <= self.setup.expires_at
+        ):
+            return (
+                'BEARISH_TO_BULLISH' if self.setup.side == 1 else 'BULLISH_TO_BEARISH'
+            )
         return {1: 'CONTINUOUS_BULLISH', -1: 'CONTINUOUS_BEARISH', 0: 'UNCLASSIFIED'}[
             self.trend
         ]
 
-    def reversal_watch(self) -> dict | None:
-        if (
-            not self.trend
-            or self.transition
-            or not self.protected
-            or len(self.bars) < 3
-        ):
-            return None
-        side = -self.trend
-        test = min(self.bars[-12:-1], key=lambda b: side * protective_edge(b, side))
-        level = protective_edge(test, side)
-        if not passed(
-            self.bars[-1].close,
-            level,
-            side,
-            max(12.0, 0.90 * self.atr, 0.55 * self.atr3),
-        ):
-            return None
-        return {
-            'side': side,
-            'test': level,
-            'test_at': test.start.isoformat(),
-            'protected_level': self.protected.price,
-            'status': 'PROTECTED_STRUCTURE_INTACT',
-        }
 
-
-def detect_range(
-    bars: list[Candle],
-    threes: list[Candle],
-    last_ten: Candle | None,
-    atr: float,
-) -> TradingRange | None:
-    atr3 = volatility(threes, minimum=2.5)
-    for size in (CONTAINMENT_MINUTES, CONTAINMENT_MINUTES // 2):
+def detect_range(bars: list[Candle], atr: float, atr3: float) -> TradingRange | None:
+    for size in (18, 9):
         if len(bars) < size:
             continue
-        group = bars[-size:]
-        low = min(b.low for b in group)
-        high = max(b.high for b in group)
+        segment = bars[-size:]
+        low = min(b.low for b in segment)
+        high = max(b.high for b in segment)
         width = high - low
-        if not max(8.0, atr * 0.8) <= width <= min(4.2 * atr, 2.2 * atr3):
-            continue
-        closes = [b.close for b in group]
-        displacement = abs(closes[-1] - closes[0])
-        travel = sum(abs(b - a) for a, b in zip(closes, closes[1:]))
-        if displacement > min(0.33 * width, 0.30 * travel):
+        if not max(8.0, 0.8 * atr) <= width <= min(4.2 * atr, 2.2 * atr3):
             continue
         mid = (high + low) / 2
-        sides = [x > mid for x in closes if abs(x - mid) >= 0.07 * width]
-        if sum(a != b for a, b in zip(sides, sides[1:])) >= 3:
-            if last_ten and last_ten.start >= group[0].start - 3 * MINUTE:
-                outer_low, outer_high = min(low, last_ten.low), max(high, last_ten.high)
-                if (
-                    outer_high - outer_low <= min(1.25 * width, 2.2 * atr3)
-                    and low <= last_ten.close <= high
-                ):
-                    low, high = outer_low, outer_high
-            return TradingRange(low, high, bar_end(group[-1]), max(1.0, 0.25 * atr))
+        closes = [b.close for b in segment]
+        travel = sum(abs(right - left) for left, right in zip(closes, closes[1:]))
+        if abs(closes[0] - closes[-1]) > min(0.34 * width, 0.30 * travel):
+            continue
+        zones = []
+        for b in segment:
+            if b.close > mid + 0.07 * width:
+                zone = 1
+            elif b.close < mid - 0.07 * width:
+                zone = -1
+            else:
+                continue
+            if not zones or zones[-1] != zone:
+                zones.append(zone)
+        if len(zones) >= 4:
+            return TradingRange(low, high, bar_end(segment[-1]), max(1.0, 0.25 * atr))
     return None
 
 
-def held_break(
-    bars: list[Candle], side: int, level: float, margin: float = 0.0
-) -> bool:
-    return len(bars) >= 2 and all(
-        passed(b.close, level, side, margin) for b in bars[-2:]
-    )
-
-
-def reversal_pattern(
-    bars: list[Candle], pivots: list[Swing], side: int, atr: float, since: datetime
-) -> Reversal | None:
-    # Index by timestamp to keep both tests and their reaction causal.
-    index = {b.start: n for n, b in enumerate(bars)}
-    distinct = [p for p in pivots if p.at >= since and p.at in index]
-    tolerance = min(15.0, max(3.0, 0.65 * atr))
-    for j in range(len(distinct) - 1, 0, -1):
-        second = distinct[j]
-        right = index[second.at]
-        choices = []
-        for first in distinct[:j]:
-            left = index[first.at]
-            inside = bars[left + 1 : right]
-            if not inside or abs(first.price - second.price) > tolerance:
-                continue
-            stop = min((first, second), key=lambda p: side * p.price)
-            if any(
-                passed(stop.price, protective_edge(b, side), side)
-                for b in bars[left + 1 :]
-            ):
-                continue
-            neckline = max(
-                (favorable_edge(b, side) for b in inside), key=lambda x: side * x
-            )
-            near_test = max(first.price * side, second.price * side)
-            excursion = max(b.close * side for b in inside) - near_test
-            if side * neckline - near_test < max(8.0, 0.5 * atr) or excursion < max(
-                3.0, 0.25 * atr
-            ):
-                continue
-            choices.append(Reversal(side, neckline, first, second, stop))
-        if choices:
-            return max(
-                choices, key=lambda p: (side * (p.neckline - p.stop.price), p.first.at)
-            )
+def find_rejection(
+    bars: list[Candle],
+    previous_tests: list[Swing],
+    side: int,
+    atr: float,
+) -> Rejection | None:
+    # The last completed candle can supply the second test. Its failure is
+    # confirmed separately by a completed close or a fresh live index quote.
+    latest = bars[-1]
+    through = bar_end(latest)
+    second = Swing(protective_edge(latest, side), latest.start, through)
+    tolerance = max(5.0, min(15.0, 0.70 * atr))
+    for first in reversed(previous_tests):
+        if through - first.at > REJECTION_LOOKBACK:
+            break
+        if (
+            second.at - first.at < 3 * MINUTE
+            or abs(first.price - second.price) > tolerance
+        ):
+            continue
+        between = [b for b in bars if first.at < b.start < second.at]
+        outer = min(first.price * side, second.price * side)
+        if not between or any(side * protective_edge(b, side) < outer for b in between):
+            continue
+        reaction = max(
+            (favorable_edge(b, side) for b in between), key=lambda p: p * side
+        )
+        near = max(first.price * side, second.price * side)
+        if reaction * side - near >= max(12.0, 0.9 * atr) and max(
+            b.close * side for b in between
+        ) - near >= max(7.0, 0.55 * atr):
+            return Rejection(side, first, second, reaction, through)
     return None
 
 
 class SessionStructure:
-    """Causal state machine. A bar can confirm a new leg only once."""
-
-    def __init__(self, opens_at: datetime):
-        self.opens_at = opens_at
+    def __init__(self, opens: datetime):
+        self.opens = opens
         self.trend = 0
         self.protected: Swing | None = None
         self.leg: DirectionalLeg | None = None
-        self.transition: StructureTransition | None = None
         self.range: TradingRange | None = None
-        self.released_range: RangeBreak | None = None
-        self.pending_range_retest: EntrySetup | None = None
+        self.range_exit: RangeExit | None = None
+        self.pending_trend_break: datetime | None = None
+        self.fired_rejections: set[datetime] = set()
         self.setup: EntrySetup | None = None
+        self.rejection: Rejection | None = None
         self.pivots: dict[int, list[Swing]] = {1: [], -1: []}
-        self.swings3: dict[int, list[Swing]] = {1: [], -1: []}
+        self.swing3: dict[int, Swing] = {}
 
-    def start_leg(
+    def new_setup(
         self,
-        bar: Candle,
         side: int,
         kind: str,
         trigger: float,
-        stop: Swing,
-        oi_level: float,
+        invalidation: Swing,
+        now: datetime,
         atr: float,
-        atr3: float,
         *,
-        break_margin: float = 0.0,
-        defended_at: datetime | None = None,
-    ) -> None:
-        now = bar_end(bar)
-        self.trend, self.protected = side, stop
-        self.leg = DirectionalLeg(
-            side, Swing(favorable_edge(bar, side), bar.start, now)
-        )
-        self.setup = EntrySetup(
+        defended: bool = False,
+        live: bool = False,
+    ) -> EntrySetup:
+        return EntrySetup(
             side,
             kind,
             trigger,
-            stop,
-            oi_level,
+            invalidation,
             now,
-            now + MAX_TRIGGER_AGE,
-            stop.price,
             now,
-            min(36.0, max(15.0, 1.10 * atr)),
-            min(115.0, max(60.0 if kind == 'REVERSAL' else 48.0, 1.65 * atr3)),
-            break_margin=break_margin,
-            defended_at=defended_at,
+            setup_deadline(now, self.opens),
+            min(
+                32.0 if now - self.opens <= 18 * MINUTE else 26.0, max(17.0, 1.15 * atr)
+            ),
+            now if defended else None,
+            live,
         )
 
-    def bootstrap(
-        self, bar: Candle, threes: list[Candle], atr: float, atr3: float
-    ) -> None:
-        if len(threes) < 2 or bar_end(threes[-1], 3) != bar_end(bar):
-            return
-        prior, current = threes[-2:]
-        side = 1 if current.close > prior.close else -1
-        level = favorable_edge(prior, side)
-        if not (
-            passed(current.close, level, side, 0.10 * atr)
-            and abs(current.close - prior.close) >= max(STRONG_MOVE, 0.60 * atr3)
-            and passed(
-                protective_edge(current, side), protective_edge(prior, side), side
+    def set_trend(self, side: int, stop: Swing, bar: Candle) -> None:
+        self.trend, self.protected = side, stop
+        self.pending_trend_break = None
+        self.leg = DirectionalLeg(
+            side, Swing(favorable_edge(bar, side), bar.start, bar_end(bar))
+        )
+
+    def advance_trend(
+        self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
+    ) -> EntrySetup | None:
+        if len(threes) < 2:
+            return None
+        bar = bars[-1]
+        now = bar_end(bar)
+        old, recent = threes[-2:]
+        move = recent.close - old.close
+        if self.trend and self.protected:
+            side = self.trend
+            if not held_break(bars, -side, self.protected.price, 0.10 * atr):
+                if held_break(bars, side, self.protected.price):
+                    self.pending_trend_break = None
+                swing = self.swing3.get(side)
+                if (
+                    self.pending_trend_break is None
+                    and swing
+                    and swing.at > self.protected.at
+                    and passed(swing.price, self.protected.price, side)
+                ):
+                    self.protected = swing
+                return None
+            if self.pending_trend_break is None:
+                self.pending_trend_break = bar_end(bars[-2])
+            # Keep the last trend during a break until a completed block or a
+            # completed two-test reversal confirms the direction change.
+            if bar_end(recent, 3) != now or side * move >= -max(6.0, 0.20 * atr3):
+                return None
+            boundary = self.protected.price
+            side = -side
+            swing = self.swing3.get(side)
+            stop = (
+                swing
+                if swing and now - swing.at <= REJECTION_LOOKBACK
+                else Swing(protective_edge(old, side), old.start, bar_end(old, 3))
             )
+            first_break = self.pending_trend_break
+            self.set_trend(side, stop, bar)
+            candidate = self.new_setup(
+                side, 'TREND_BREAK', boundary, stop, first_break, atr
+            )
+            return replace(candidate, confirmed_at=now)
+
+        side = 1 if move > 0 else -1
+        edge = favorable_edge(old, side)
+        if (
+            bar_end(recent, 3) == now
+            and abs(move) >= max(15.0, 0.55 * atr3)
+            and passed(recent.close, edge, side, 0.10 * atr)
         ):
-            return
-        if bar_end(bar) - self.opens_at > OPENING_PHASE:
-            protections, objectives = self.swings3[side], self.swings3[-side]
-            if not (
-                len(protections) >= 2
-                and len(objectives) >= 2
-                and passed(protections[-1].price, protections[-2].price, side)
-                and passed(objectives[-1].price, objectives[-2].price, side)
-                and passed(current.close, objectives[-1].price, side)
-            ):
-                return
-            stop = protections[-1]
-            kind = 'TREND_BREAK'
+            pivot = self.swing3.get(side) or Swing(
+                protective_edge(old, side), old.start, bar_end(old, 3)
+            )
+            self.set_trend(side, pivot, bar)
+            return self.new_setup(side, 'TREND_BREAK', edge, pivot, now, atr)
+        return None
+
+    def advance_leg(
+        self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
+    ) -> EntrySetup | None:
+        leg = self.leg
+        if leg is None:
+            return None
+        bar = bars[-1]
+        now = bar_end(bar)
+        side = leg.side
+        edge, adverse = favorable_edge(bar, side), protective_edge(bar, side)
+        pullback = leg.pullback
+        if pullback:
+            if passed(pullback.price, adverse, side):
+                pullback = leg.pullback = Swing(adverse, bar.start, now)
+            if passed(bar.close, leg.extreme.price, side, 0.05):
+                trigger = leg.extreme.price
+                self.set_trend(side, pullback, bar)
+                return self.new_setup(
+                    side, 'PULLBACK_RESUMPTION', trigger, pullback, now, atr
+                )
         else:
-            stop = Swing(protective_edge(prior, side), prior.start, bar_end(prior, 3))
-            kind = 'OPENING_BREAK'
-        self.start_leg(bar, side, kind, level, stop, stop.price, atr, atr3)
+            if passed(edge, leg.extreme.price, side):
+                leg.extreme = Swing(edge, bar.start, now)
+            opening = now - self.opens <= 18 * MINUTE
+            compact = (
+                len(threes) >= 2
+                and bar_end(threes[-1], 3) == now
+                and passed(
+                    threes[-1].close, threes[-2].close, -side, max(6.0, 0.20 * atr3)
+                )
+            )
+            floor = (
+                max(10.0, 0.50 * atr, 0.25 * atr3)
+                if opening
+                else max(9.0, 0.60 * atr, 0.35 * atr3)
+                if compact
+                else max(12.0, 0.85 * atr, 0.85 * atr3)
+            )
+            if passed(leg.extreme.price, bar.close, side, floor):
+                leg.pullback = Swing(adverse, bar.start, now)
+
+        if len(bars) < 3 or self.range:
+            return None
+        before, test, reaction = bars[-3:]
+        test_level = protective_edge(test, side)
+        if (
+            passed(before.close, test.close, side, max(10.0, 0.85 * atr))
+            and passed(reaction.close, before.close, side, 0.10 * atr)
+            and passed(reaction.close, test.close, side, max(13.0, 1.1 * atr))
+            and abs(protective_edge(reaction, side) - test_level)
+            <= max(3.0, 0.35 * atr)
+            and passed(leg.extreme.price, test_level, side, max(15.0, 0.70 * atr3))
+        ):
+            pivot = Swing(
+                min(
+                    (test_level, protective_edge(reaction, side)),
+                    key=lambda x: side * x,
+                ),
+                test.start,
+                now,
+            )
+            return self.new_setup(
+                side, 'PULLBACK_RECLAIM', before.close, pivot, now, atr, defended=True
+            )
+        return None
 
     def advance_range(
         self,
         bars: list[Candle],
-        threes: list[Candle],
-        last_ten: Candle | None,
         atr: float,
         atr3: float,
-    ) -> bool:
+        directional: EntrySetup | None,
+    ) -> EntrySetup | None:
         bar = bars[-1]
         now = bar_end(bar)
-        released = self.released_range
+        released = self.range_exit
+        if released and now > released.opened_at + REJECTION_LOOKBACK:
+            self.range_exit = released = None
         if released:
-            breakout = released.setup
-            if now > breakout.expires_at:
-                self.released_range = None
-            elif not passed(bar.close, breakout.trigger, breakout.side):
-                self.range, self.released_range = released.region, None
-                self.pending_range_retest = None
-                if self.setup and self.setup.identity == breakout.identity:
-                    self.setup = None
-        if self.range is None and self.released_range is None:
-            self.range = detect_range(bars, threes, last_ten, atr)
+            region = released.region
+            side = released.side
+            if held_break(bars, -side, region.edge(-side), region.margin):
+                self.range, self.range_exit = region, None
+                released = None
+            elif all(region.low <= closed.close <= region.high for closed in bars[-2:]):
+                released.holding = False
+            elif held_break(bars, side, region.edge(side), region.margin):
+                released.holding = True
+        if (
+            self.range is None
+            and released is None
+            and directional is None
+            and (self.setup is None or now > self.setup.expires_at)
+        ):
+            self.range = detect_range(bars, atr, atr3)
         region = self.range
-        if region is None:
-            return False
-        if self.setup and self.setup.kind != 'REVERSAL':
-            self.setup = None
-        if (
-            len(threes) < 2
-            or bar_end(threes[-1], 3) != now
-            or now <= region.established_at
-        ):
-            return True
-        for side in (1, -1):
-            level = region.edge(side)
-            if not (
-                held_break(bars, side, level, region.margin)
-                and passed(threes[-1].close, level, side, region.margin)
-                and passed(threes[-1].close, threes[-2].close, side)
-            ):
-                continue
-            defenses = [
-                p
-                for p in self.pivots[side]
-                if p.at >= region.established_at - CONTAINMENT_MINUTES * MINUTE
-                and region.low <= p.price <= region.high
-            ]
-            stop = (
-                defenses[-1]
-                if defenses
-                else Swing(
-                    region.edge(-side), region.established_at, region.established_at
+        if region:
+            for side in (1, -1):
+                edge = region.edge(side)
+                if not held_break(bars, side, edge, region.margin):
+                    continue
+                first_break = bar_end(bars[-2])
+                pivots = [
+                    p
+                    for p in self.pivots[side]
+                    if p.at >= region.established_at - 18 * MINUTE
+                    and region.low <= p.price <= region.high
+                ]
+                invalidation = (
+                    pivots[-1]
+                    if pivots
+                    else Swing(
+                        region.edge(-side), region.established_at, region.established_at
+                    )
                 )
-            )
-            self.start_leg(
-                bar,
-                side,
-                'RANGE_BREAK',
-                level,
-                stop,
-                level,
-                atr,
-                atr3,
-                break_margin=region.margin,
-            )
-            assert self.setup is not None
-            self.range, self.released_range = None, RangeBreak(region, self.setup)
-            self.pending_range_retest = self.setup
-            if not (
-                self.transition
-                and self.transition.initial_confirmed
-                and side == -self.transition.previous_side
-            ):
-                self.transition = None
-            return True
-        return True
-
-    def advance_range_retest(self, bars: list[Candle], atr: float, atr3: float) -> None:
-        breakout = self.pending_range_retest
-        if breakout is None:
-            return
-        now = bar_end(bars[-1])
-        side, level = breakout.side, breakout.trigger
-        if (
-            side != self.trend
-            or now > breakout.confirmed_at + EXTREME_CONFIRMATION_AGE
-            or held_break(bars, -side, level)
-        ):
-            self.pending_range_retest = None
-            return
-        if now <= breakout.expires_at or (
-            self.setup and self.setup.confirmed_at == now
-        ):
-            return
-        stop = confirmed_swing(bars, side, 1)
-        if not stop or abs(stop.price - level) > max(1.0, 0.65 * atr):
-            return
-        pivot = bars[-2]
-        trigger = favorable_edge(pivot, side)
-        if not (
-            self.protected
-            and passed(stop.price, self.protected.price, side)
-            and held_break(bars, side, level)
-            and passed(bars[-1].close, trigger, side)
-        ):
-            return
-        self.start_leg(
-            bars[-1],
-            side,
-            'RANGE_RETEST',
-            trigger,
-            stop,
-            level,
-            atr,
-            atr3,
-            defended_at=now,
-        )
-        self.pending_range_retest = None
-
-    def advance_transition(
-        self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
-    ) -> None:
-        transition = self.transition
-        assert transition is not None
-        bar = bars[-1]
-        now = bar_end(bar)
-        side = -transition.previous_side
-        if not transition.initial_confirmed:
-            if held_break(bars, -side, transition.protection.price, 0.10 * atr):
-                self.trend, self.protected = -side, transition.protection
-                self.leg = DirectionalLeg(
-                    -side, Swing(favorable_edge(bar, -side), bar.start, now)
+                candidate = self.new_setup(
+                    side, 'RANGE_BREAK', edge, invalidation, first_break, atr
                 )
-                self.transition, self.setup = None, None
-                return
-            if now - transition.started_at > EXTREME_CONFIRMATION_AGE:
-                self.transition, self.setup = None, None
-                self.bootstrap(bar, threes, atr, atr3)
-                return
-            pattern = reversal_pattern(
-                bars,
-                self.pivots[side],
-                side,
-                atr,
-                transition.started_at - EXTREME_CONFIRMATION_AGE,
-            )
-            transition.pattern = pattern
-            if pattern is None:
-                return
-            boundary = max(
-                (pattern.neckline, transition.protection.price), key=lambda x: side * x
-            )
-            if not held_break(bars, side, boundary):
-                return
-            objectives = [
-                p
-                for p in self.pivots[-side]
-                if pattern.first.at - 12 * MINUTE <= p.at < pattern.first.at
-                and passed(p.price, boundary, side, max(2.0, 0.35 * atr))
-            ]
-            transition.expansion_level = objectives[-1].price if objectives else None
-            transition.initial_confirmed = True
-            self.start_leg(
-                bar, side, 'REVERSAL', boundary, pattern.stop, boundary, atr, atr3
-            )
-            return
-
-        pattern = transition.pattern
-        if pattern is None or not passed(bar.close, pattern.stop.price, side):
-            # A failed reversal invalidates its setup; reassess from newly
-            # confirmed structure rather than resuming the failed candidate.
-            self.trend, self.protected, self.leg = 0, None, None
-            self.transition, self.setup = None, None
-            return
-        level = transition.expansion_level
-        if (
-            level is not None
-            and passed(bar.close, level, side)
-            and not passed(bars[-2].close, level, side)
-        ):
-            # This level was fixed when the reversal was confirmed. It is
-            # not a rolling high or low printed by the current impulse.
-            self.start_leg(bar, side, 'REVERSAL', level, pattern.stop, level, atr, atr3)
-            transition.expansion_level = None
-            return
-        if now - transition.started_at > EXTREME_CONFIRMATION_AGE:
-            self.transition = None
-        self.advance_leg(bar, threes, atr, atr3)
-
-    def advance_leg(
-        self, bar: Candle, threes: list[Candle], atr: float, atr3: float
-    ) -> None:
-        leg = self.leg
-        if leg is None:
-            return
-        side = leg.side
-        now = bar_end(bar)
-        edge = favorable_edge(bar, side)
-        opposite = protective_edge(bar, side)
-        if leg.pullback is not None:
-            if passed(leg.pullback.price, opposite, side):
-                leg.pullback = Swing(opposite, bar.start, now)
-            if passed(bar.close, leg.extreme.price, side, 0.05):
-                if self.protected and passed(
-                    leg.pullback.price, self.protected.price, side
+                self.range_exit = RangeExit(region, side, first_break)
+                self.range = None
+                self.set_trend(side, invalidation, bar)
+                return replace(candidate, confirmed_at=now)
+            return None
+        if released:
+            side = released.side
+            edge = released.region.edge(side)
+            if (
+                not released.retest_used
+                and self.trend == side
+                and now >= released.opened_at + DISPATCH_INTERVAL
+                and held_break(bars, side, edge)
+            ):
+                pivot = confirmed_swing(bars, side, 1)
+                local_break = favorable_edge(bars[-2], side)
+                if (
+                    pivot
+                    and abs(pivot.price - edge) <= max(3.0, 0.65 * atr)
+                    and passed(bar.close, local_break, side)
+                    and passed(bar.close, bars[-3].close, side)
+                    and passed(bar.close, edge, side, 0.10 * atr)
                 ):
-                    reference = (
-                        protective_edge(threes[-2], side)
-                        if len(threes) >= 2
-                        else leg.pullback.price
-                    )
-                    self.start_leg(
-                        bar,
+                    released.retest_used = True
+                    return self.new_setup(
                         side,
-                        'PULLBACK_RESUMPTION',
-                        leg.extreme.price,
-                        leg.pullback,
-                        reference,
+                        'RANGE_RETEST',
+                        local_break,
+                        pivot,
+                        now,
                         atr,
-                        atr3,
+                        defended=True,
                     )
-                    return
-                leg.pullback = None
-                leg.extreme = Swing(edge, bar.start, now)
-            return
-
-        if passed(edge, leg.extreme.price, side):
-            leg.extreme = Swing(edge, bar.start, now)
-        opening = now - self.opens_at <= OPENING_PHASE
-        distance = (
-            max(10.0, 0.50 * atr, 0.25 * atr3)
-            if opening
-            else max(12.0, 0.85 * atr, 0.85 * atr3)
-        )
-        # A compact pullback in a persistent trend needs its own completed
-        # 3-minute countertrend move. A new favorable wick cannot certify it.
-        compact = (
-            not opening
-            and len(threes) >= 2
-            and bar_end(threes[-1], 3) == now
-            and passed(threes[-1].close, threes[-2].close, -side, max(6.0, 0.20 * atr3))
-        )
-        if compact:
-            distance = max(9.0, 0.60 * atr, 0.35 * atr3)
-        if side * (leg.extreme.price - bar.close) >= distance:
-            leg.pullback = Swing(opposite, bar.start, now)
+        return None
 
     def advance(
-        self,
-        bars: list[Candle],
-        threes: list[Candle],
-        last_ten: Candle | None,
-        atr: float,
-        atr3: float,
+        self, bars: list[Candle], threes: list[Candle], atr: float, atr3: float
     ) -> None:
-        bar = bars[-1]
-        now = bar_end(bar)
+        bar, now = bars[-1], bar_end(bars[-1])
+        previous_trend = self.trend
+        candidate = self.advance_trend(bars, threes, atr, atr3)
+        if candidate is None and previous_trend == self.trend:
+            candidate = self.advance_leg(bars, threes, atr, atr3)
+        range_candidate = self.advance_range(bars, atr, atr3, candidate)
+        if range_candidate:
+            candidate = range_candidate
+
+        if previous_trend:
+            reversal = find_rejection(
+                bars[-22:], self.pivots[-previous_trend], -previous_trend, atr
+            )
+            if reversal:
+                prior = self.rejection
+                if (
+                    prior
+                    and prior.side == reversal.side
+                    and reversal.second.at - prior.second.at <= MINUTE
+                    and abs(reversal.second.price - prior.second.price)
+                    <= max(3.0, 0.35 * atr)
+                ):
+                    reversal = replace(reversal, origin=prior.origin)
+                self.rejection = reversal
+        pattern = self.rejection
+        if pattern and (
+            now - pattern.second.known_at > 8 * MINUTE
+            or passed(
+                pattern.invalidation.price,
+                protective_edge(bar, pattern.side),
+                pattern.side,
+            )
+        ):
+            self.rejection = pattern = None
+        if pattern and passed(bar.close, pattern.trigger, pattern.side, 0.10 * atr):
+            if pattern.origin not in self.fired_rejections:
+                self.fired_rejections.add(pattern.origin)
+                candidate = self.new_setup(
+                    pattern.side,
+                    'REVERSAL',
+                    pattern.trigger,
+                    pattern.invalidation,
+                    pattern.origin,
+                    atr,
+                    defended=True,
+                )
+                candidate = replace(candidate, confirmed_at=now, defended_at=now)
+            if held_break(bars, pattern.side, pattern.reaction, 0.10 * atr):
+                self.set_trend(pattern.side, pattern.invalidation, bar)
+        if candidate:
+            self.setup = candidate
+
         for side in (1, -1):
-            pivot = confirmed_swing(bars, side, 1)
-            if pivot:
-                self.pivots[side].append(pivot)
+            swing = confirmed_swing(bars, side, 1)
+            if swing:
+                self.pivots[side].append(swing)
             if threes and bar_end(threes[-1], 3) == now:
-                pivot3 = confirmed_swing(threes, side, 3)
-                if pivot3:
-                    self.swings3[side].append(pivot3)
+                swing3 = confirmed_swing(threes, side, 3)
+                if swing3:
+                    self.swing3[side] = swing3
 
+    def live_setup(
+        self, spot: float | None, through: datetime, atr: float
+    ) -> EntrySetup | None:
+        pattern = self.rejection
         if (
-            self.trend
-            and self.protected
-            and held_break(bars, -self.trend, self.protected.price, 0.10 * atr)
+            pattern
+            and spot is not None
+            and pattern.second.known_at == through
+            and pattern.origin not in self.fired_rejections
+            and passed(spot, pattern.trigger, pattern.side, max(2.0, 0.20 * atr))
+            and (self.setup is None or self.setup.confirmed_at < through)
         ):
-            self.transition = StructureTransition(self.trend, self.protected, now)
-            self.trend, self.protected, self.leg, self.setup = 0, None, None, None
-
-        processing_transition = self.transition is not None
-        if processing_transition:
-            self.advance_transition(bars, threes, atr, atr3)
-
-        if self.advance_range(bars, threes, last_ten, atr, atr3):
-            return
-        if not processing_transition:
-            if self.trend:
-                self.advance_leg(bar, threes, atr, atr3)
-            else:
-                self.bootstrap(bar, threes, atr, atr3)
-        self.advance_range_retest(bars, atr, atr3)
-
-        # A confirmed higher low/lower high can tighten the trend boundary
-        # without making a new entry setup or moving an active position's stop.
-        side, protected, leg = self.trend, self.protected, self.leg
-        if side and protected and leg and leg.pullback is None and self.swings3[side]:
-            swing = self.swings3[side][-1]
-            if (
-                swing.known_at == now
-                and swing.at > protected.at
-                and passed(swing.price, protected.price, side)
-            ):
-                self.protected = swing
-
-        setup = self.setup
-        if (
-            setup
-            and setup.defended_at is None
-            and now > setup.confirmed_at
-            and now <= setup.expires_at
-            and len(bars) >= 2
-            and abs(protective_edge(bar, setup.side) - setup.trigger)
-            <= max(1.0, 0.20 * atr)
-            and held_break(bars, setup.side, setup.trigger)
-        ):
-            self.setup = replace(setup, defended_at=now)
+            # Spot confirms the response to the already-completed second test.
+            # Keep this anchored to the second candle across scans and retries.
+            candidate = self.new_setup(
+                pattern.side,
+                'REVERSAL',
+                pattern.trigger,
+                pattern.invalidation,
+                pattern.origin,
+                atr,
+                defended=True,
+                live=True,
+            )
+            return replace(candidate, confirmed_at=through, defended_at=through)
+        return self.setup
 
 
 def analyze_price(
-    bars: list[Candle], prior_ten: list[Candle], opens_at: datetime
+    bars: list[Candle],
+    prior_ten: list[Candle],
+    opens: datetime,
+    spot: float | None = None,
 ) -> PriceContext:
     bars = contiguous_tail(bars)
-    all_threes = aggregate(bars, 3, opens_at)
-    all_tens = aggregate(bars, 10, opens_at)
-    engine = SessionStructure(opens_at)
-    recent: list[Candle] = []
+    known_threes = aggregate(bars, 3, opens)
     threes: list[Candle] = []
-    tens: list[Candle] = []
-    atr = atr3 = 2.5
+    recent: list[Candle] = []
+    structure = SessionStructure(opens)
     for bar in bars:
         recent.append(bar)
-        if len(threes) < len(all_threes) and bar_end(
-            all_threes[len(threes)], 3
+        if len(threes) < len(known_threes) and bar_end(
+            known_threes[len(threes)], 3
         ) <= bar_end(bar):
-            threes.append(all_threes[len(threes)])
-        if len(tens) < len(all_tens) and bar_end(all_tens[len(tens)], 10) <= bar_end(
-            bar
-        ):
-            tens.append(all_tens[len(tens)])
+            threes.append(known_threes[len(threes)])
         atr = volatility(recent, minimum=2.5)
         atr3 = volatility(threes, minimum=2.5)
-        engine.advance(recent, threes, tens[-1] if tens else None, atr, atr3)
+        structure.advance(recent, threes, atr, atr3)
     move = threes[-1].close - threes[-2].close if len(threes) >= 2 else None
     acceleration = (
         move - (threes[-2].close - threes[-3].close) if len(threes) >= 3 else None
     )
+    setup = structure.live_setup(spot, bar_end(bars[-1]), atr)
     return PriceContext(
         bars,
         threes,
-        tens,
+        aggregate(bars, 10, opens),
         prior_ten,
         atr,
         atr3,
-        engine.trend,
-        engine.protected,
-        engine.range,
-        engine.transition,
-        engine.setup,
+        structure.trend,
+        structure.protected,
+        structure.range,
+        setup,
+        structure.rejection,
         move,
         acceleration,
-        engine.released_range,
+        structure.range_exit,
     )
 
 
@@ -2118,7 +2035,7 @@ def last_stop_boundary(
     exited = timestamp(last['at'])
     if exited.date() != ctx.through.date():
         return None, {}
-    if setup.confirmed_at <= exited:
+    if setup.first_break_at <= exited:
         return 'SETUP_PREDATES_EXIT', {}
     direction = 'BULLISH' if setup.side == 1 else 'BEARISH'
     reason = last.get('reason') or next(
@@ -2140,7 +2057,7 @@ def last_stop_boundary(
     post = [b for b in ctx.bars if b.start >= exited]
     evidence = {'exit_at': exited.isoformat(), 'post_stop_outer_boundary': edge}
     if not (
-        setup.stop.at >= exited
+        setup.invalidation.at >= exited
         and ctx.threes
         and ctx.threes[-1].start >= exited
         and held_break(post, side, edge, margin)
@@ -2149,23 +2066,6 @@ def last_stop_boundary(
     ):
         return 'POST_STOP_OUTER_BREAK_AND_HOLD_REQUIRED', evidence
     return None, evidence
-
-
-def strike_choices(
-    band: StrikeBand, setup: EntrySetup, listed: dict[tuple[str, float], dict]
-) -> list[tuple[int, OIPair, dict, str]]:
-    side = setup.side
-    kind = 'CE' if side == 1 else 'PE'
-    output = []
-    for offset in (-side, -2 * side):
-        pair = band.pairs.get(offset)
-        if pair is None:
-            continue
-        contract = listed.get((kind, pair.strike))
-        confirmation = pair.rule(side, setup.defended_at is not None)
-        if contract is not None and confirmation:
-            output.append((offset, pair, contract, confirmation))
-    return output
 
 
 def select_targets(
@@ -2205,6 +2105,89 @@ def select_targets(
     return choose(T1_SPOT_BAND, (35.0, 64.99)), choose(T2_SPOT_BAND, (65.0, 115.0))
 
 
+@dataclass(frozen=True)
+class StrikeConfirmation:
+    entry: OIPair
+    defense: OIPair
+    entry_unwind: float | None
+    defense_build: float | None
+    rule: str | None
+
+    @classmethod
+    def check(
+        cls, entry: OIPair, defense: OIPair, side: int, retest: bool
+    ) -> StrikeConfirmation:
+        offered = entry.call if side == 1 else entry.put
+        supporting = defense.put if side == 1 else defense.call
+        unwind = -offered.increase if offered else None
+        buildup = supporting.increase if supporting else None
+        rule = None
+        if unwind is not None and buildup is not None and min(unwind, buildup) > 0:
+            if max(unwind, buildup) >= OI_LEVEL_MATERIAL_CHANGE:
+                rule = 'ENTRY_AND_DEFENSE_2_PERCENT'
+            elif (
+                retest
+                and max(unwind, buildup) >= EARLY_RETEST_OI_CHANGE
+                and min(unwind, buildup) >= 0.005
+            ):
+                rule = 'DEFENDED_RETEST_1_9_PERCENT'
+        return cls(entry, defense, unwind, buildup, rule)
+
+    @property
+    def score(self) -> float:
+        return (self.entry_unwind or 0) + (self.defense_build or 0)
+
+    def public(self) -> dict:
+        return {
+            'entry_pair': self.entry.public(),
+            'defense_pair': self.defense.public(),
+            'entry_unwind_pct': self.entry_unwind * 100
+            if self.entry_unwind is not None
+            else None,
+            'defense_build_pct': self.defense_build * 100
+            if self.defense_build is not None
+            else None,
+            'rule': self.rule,
+        }
+
+
+@dataclass(frozen=True)
+class StrikeChoice:
+    offset: int
+    row: dict
+    confirmation: StrikeConfirmation
+
+
+def confirm_strikes(
+    band: StrikeBand,
+    setup: EntrySetup,
+    pairs: dict[float, OIPair],
+    grid: list[float],
+    listed: dict[tuple[str, float], dict],
+) -> tuple[tuple[StrikeChoice, ...], list[dict]]:
+    side, retest = setup.side, setup.defended_at is not None
+    kind = 'CE' if side == 1 else 'PE'
+    center = grid.index(band.atm)
+    choices, evaluated = [], []
+    for offset in (-side, -2 * side):
+        entry, defense_index = band.pairs.get(offset), center + offset - side
+        if entry is None or not 0 <= defense_index < len(grid):
+            evaluated.append(
+                {'offset': offset, 'reason': 'ENTRY_OR_ADJACENT_STRIKE_NOT_LISTED'}
+            )
+            continue
+        defense_strike = grid[defense_index]
+        defense = pairs.get(defense_strike, OIPair(defense_strike, None, None))
+        evidence = StrikeConfirmation.check(entry, defense, side, retest)
+        row = listed.get((kind, entry.strike))
+        evaluated.append(
+            {'offset': offset, 'strike': entry.strike, **evidence.public()}
+        )
+        if evidence.rule and row:
+            choices.append(StrikeChoice(offset, row, evidence))
+    return tuple(choices), evaluated
+
+
 TERMINAL_SETUP_STATES = frozenset({'INVALIDATED', 'EXPIRED', 'ENTERED'})
 
 
@@ -2214,7 +2197,7 @@ class EntryAssessment:
     reason: str
     evidence: dict
     plan: RiskPlan | None = None
-    choices: tuple[tuple[int, OIPair, dict, str], ...] = ()
+    choices: tuple[StrikeChoice, ...] = ()
 
 
 def assess_entry(
@@ -2229,117 +2212,108 @@ def assess_entry(
     cfg: Config,
 ) -> EntryAssessment:
     side = setup.side
-    risk = side * (spot - setup.stop.price)
-    trigger_distance = side * (spot - setup.trigger)
-    leg_distance = side * (spot - setup.leg_anchor)
-    minimum = max(MIN_STOP_POINTS, MIN_STOP_ATR_FRACTION * ctx.atr)
-    source = (
-        'REVERSAL_SWING' if setup.kind == 'REVERSAL' else 'CONFIRMED_STRUCTURAL_SWING'
-    )
-    evidence = {
-        'spot': spot,
-        'stop': setup.stop.price,
-        'stop_at': setup.stop.at.isoformat(),
-        'stop_known_at': setup.stop.known_at.isoformat(),
-        'stop_source': source,
-        'risk_points': round(risk, 4),
-        'minimum_stop_clearance': round(minimum, 4),
-        'maximum_initial_risk': cfg.max_initial_risk_points,
-        'risk_budget_exceeded': risk > cfg.max_initial_risk_points,
-        'trigger_extension': round(trigger_distance, 4),
-        'trigger_limit': setup.trigger_limit,
-        'leg_extension': round(leg_distance, 4),
-        'leg_limit': setup.leg_limit,
-        'atm': band.atm,
-    }
-
-    def blocked(reason: str, status: str = 'WAITING_CONFIRMATION') -> EntryAssessment:
-        return EntryAssessment(status, reason, evidence)
-
-    if ctx.trading_range:
-        return blocked('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD', 'INVALIDATED')
-    if ctx.live_range(spot):
-        return blocked('PRICE_BACK_BEHIND_TRIGGER')
-    if risk <= 0 or any(
-        not passed(protective_edge(b, side), setup.stop.price, side)
-        for b in ctx.bars
-        if b.start >= setup.confirmed_at
-    ):
-        return blocked('STRUCTURAL_STOP_INVALIDATED', 'INVALIDATED')
-    if trigger_distance > setup.trigger_limit or leg_distance > setup.leg_limit:
-        return blocked('ENTRY_EXTENDED_FROM_TRIGGER_OR_LEG', 'INVALIDATED')
-    margin = 0.0 if setup.defended_at else setup.break_margin
-    if not passed(spot, setup.trigger, side, margin) or not passed(
-        ctx.bars[-1].close, setup.trigger, side, margin
-    ):
-        return blocked('PRICE_BACK_BEHIND_TRIGGER')
-    if setup.kind != 'REVERSAL' and (
-        ctx.trend != side
-        or ctx.move is None
-        or (side * ctx.move <= 0 and setup.defended_at is None)
-    ):
-        return blocked('COMPLETED_3M_DIRECTION_NOT_CONFIRMED')
-    if risk + 1e-9 < minimum:
-        return blocked('STOP_TOO_CLOSE_TO_LIVE_SPOT')
-    if risk > cfg.max_initial_risk_points:
-        return blocked('STOP_EXCEEDS_RISK_BUDGET')
-    reentry_reason, reentry_evidence = last_stop_boundary(state, setup, ctx, spot)
-    evidence.update(reentry_evidence)
-    if reentry_reason:
-        return blocked(
-            reentry_reason,
-            'INVALIDATED'
-            if reentry_reason == 'SETUP_PREDATES_EXIT'
-            else 'WAITING_CONFIRMATION',
-        )
-
-    pairs = paired_oi(window)
-    strike = nearest_strike(grid, setup.oi_level)
-    pair = pairs.get(strike, OIPair(strike, None, None))
-    oi_rule = pair.rule(side, setup.defended_at is not None)
-    choices = strike_choices(band, setup, listed)
-    evidence.update(
-        oi_level=setup.oi_level,
-        structure_oi=pair.public(),
-        structure_oi_rule=oi_rule,
-        eligible_strikes=[p.strike for _, p, _, _ in choices],
-    )
-    if oi_rule is None:
-        return blocked(
-            'STRUCTURE_LEVEL_OI_MISSING'
-            if pair.changes is None
-            else 'STRUCTURE_LEVEL_OI_NOT_ALIGNED'
-        )
-    if not choices:
-        return blocked('NO_DIRECTIONAL_OI_AT_ELIGIBLE_OFFSETS')
+    price_distance = side * (spot - setup.trigger)
+    stop = round(spot - side * cfg.initial_stop_points, 4)
+    risk = cfg.initial_stop_points
+    reentry, reentry_evidence = last_stop_boundary(state, setup, ctx, spot)
+    choices, evaluated = confirm_strikes(band, setup, paired_oi(window), grid, listed)
     (t1, t1_source), (t2, t2_source) = select_targets(
         ctx, window, spot, side, setup.kind
     )
-    if not 0 < min(t1, t2) or not passed(t1, spot, side) or not passed(t2, t1, side):
-        return blocked('INVALID_TARGET_LEVELS', 'INVALIDATED')
     reward = side * (t1 - spot) / risk
-    evidence.update(t1=t1, t2=t2, reward_risk=round(reward, 4))
+    evidence = {
+        'spot': spot,
+        'stop': stop,
+        'stop_source': 'LIVE_INDEX_DISTANCE',
+        'structural_invalidation': jsonable(asdict(setup.invalidation)),
+        'risk_points': risk,
+        'trigger_extension': round(price_distance, 4),
+        'trigger_limit': setup.chase_limit,
+        'atm': band.atm,
+        't1': t1,
+        't2': t2,
+        'strike_evidence': evaluated,
+        'eligible_strikes': [x.confirmation.entry.strike for x in choices],
+        **reentry_evidence,
+    }
+    failures = []
+    region = ctx.live_range(spot)
+    if region and not (
+        setup.kind == 'REVERSAL' and passed(spot, region.edge(side), side)
+    ):
+        failures.append('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD')
+    if not passed(spot, setup.invalidation.price, side) or any(
+        not passed(protective_edge(b, side), setup.invalidation.price, side)
+        for b in ctx.bars
+        if b.start >= setup.confirmed_at
+    ):
+        failures.append('PRICE_SETUP_INVALIDATED')
+    if price_distance > setup.chase_limit:
+        failures.append('ENTRY_EXTENDED_FROM_TRIGGER')
+    live_margin = max(2.0, 0.20 * ctx.atr) if setup.live_confirmation else 0.0
+    if price_distance <= live_margin or (
+        not setup.live_confirmation
+        and not passed(ctx.bars[-1].close, setup.trigger, side)
+    ):
+        failures.append('PRICE_BACK_BEHIND_TRIGGER')
+    if setup.kind not in ('REVERSAL', 'PULLBACK_RECLAIM', 'RANGE_RETEST') and (
+        ctx.trend != side or ctx.move is None or side * ctx.move <= 0
+    ):
+        failures.append('COMPLETED_3M_DIRECTION_NOT_CONFIRMED')
+    if reentry:
+        failures.append(reentry)
+    if not choices:
+        failures.append('ENTRY_AND_DEFENSE_OI_NOT_ALIGNED')
+    if min(stop, t1, t2) <= 0 or not passed(t1, spot, side) or not passed(t2, t1, side):
+        failures.append('INVALID_RISK_LEVELS')
     if cfg.min_reward_risk and reward < cfg.min_reward_risk:
-        return blocked('T1_REWARD_TO_RISK_BELOW_MINIMUM')
+        failures.append('T1_REWARD_TO_RISK_BELOW_MINIMUM')
+    evidence['failed_checks'] = failures
+    if failures:
+        # Quotes or OI can recover within the original window. A structural
+        # invalidation permanently cancels this setup.
+        terminal = {'PRICE_SETUP_INVALIDATED', 'SETUP_PREDATES_EXIT'}
+        status = (
+            'INVALIDATED' if terminal.intersection(failures) else 'WAITING_CONFIRMATION'
+        )
+        return EntryAssessment(status, failures[0], evidence)
     plan = RiskPlan(
-        setup.stop.price,
+        stop,
         t1,
         t2,
         t1_source,
         t2_source,
-        round(risk, 4),
+        risk,
         round(reward, 4),
-        source,
+        'LIVE_INDEX_DISTANCE',
     )
     return EntryAssessment(
-        'QUALIFIED', 'PRICE_OI_AND_RISK_QUALIFIED', evidence, plan, tuple(choices)
+        'QUALIFIED', 'PRICE_OI_AND_RISK_QUALIFIED', evidence, plan, choices
     )
+
+
+def entry_quote_candidates(
+    setup: EntrySetup,
+    grid: list[float],
+    band: StrikeBand,
+    pairs: dict[float, OIPair],
+    listed: dict[tuple[str, float], dict],
+) -> tuple[list[float], list[str]]:
+    center = grid.index(band.atm)
+    nearby = grid[max(0, center - 1) : center + 2]
+    keys = {}
+    for atm in nearby:
+        choices, _ = confirm_strikes(
+            StrikeBand.build(grid, atm, pairs), setup, pairs, grid, listed
+        )
+        keys.update(dict.fromkeys(c.row['instrument_key'] for c in choices))
+    return nearby, list(keys)
 
 
 def record_setup(
     engine: dict, setup: EntrySetup, status: str, reason: str, now: datetime
 ) -> dict:
-    ledger = engine.setdefault('v137_setups', {})
+    ledger = engine.setdefault('v137_1_1_setups', {})
     old = ledger.get(setup.identity, {})
     history = old.get('observations', 0) + 1
     record = {
@@ -2357,27 +2331,6 @@ def record_setup(
     return record
 
 
-def entry_quote_candidates(
-    setup: EntrySetup,
-    grid: list[float],
-    band: StrikeBand,
-    pairs: dict[float, OIPair],
-    listed: dict[tuple[str, float], dict],
-) -> tuple[list[float], list[str]]:
-    center = grid.index(band.atm)
-    nearby = grid[max(0, center - 1) : center + 2]
-    keys = dict.fromkeys(
-        row['instrument_key']
-        for atm in nearby
-        for _, _, row, _ in strike_choices(
-            StrikeBand.build(grid, atm, pairs), setup, listed
-        )
-    )
-    return nearby, list(keys)
-
-
-# Reference position management. Candle observations and live quotes have
-# independent timestamps. A newly published adjustment is never retroactive.
 def runner_price_support(threes: list[Candle], side: int) -> bool:
     if len(threes) < 2 or threes[-1].start - threes[-2].start != DISPATCH_INTERVAL:
         return False
@@ -2636,6 +2589,8 @@ def refine_reference(
     spot: float,
     band: StrikeBand | None,
     observed_at: datetime,
+    *,
+    defense_confirms: bool | None = None,
 ) -> tuple[str, dict] | None:
     if (
         not position.get('t1_hit')
@@ -2660,12 +2615,16 @@ def refine_reference(
         prior_target_is_ahead = (
             position['t2_source'] != 'RUNNER_STRUCTURE' or side * (old_t2 - spot) > 0
         )
+        directional_oi = defense_confirms
+        if directional_oi is None:
+            directional_oi = band is not None and any(
+                pair.rule(side) for pair in band.pairs.values()
+            )
         if (
             runner
             and runner.get('reached_at')
             and prior_target_is_ahead
-            and band is not None
-            and any(pair.rule(side) for pair in band.pairs.values())
+            and directional_oi
         ):
             # Existing, untouched price structure remains binding. A scan may
             # extend an active objective only while it is still ahead of spot.
@@ -2824,7 +2783,8 @@ def open_position(
         'entry_ask': contract['ask'],
         'initial_stop': plan.stop,
         'setup_level': setup.trigger,
-        'setup_invalidation': plan.stop,
+        'setup_invalidation': setup.invalidation.price,
+        'defense_strike': contract['oi_confirmation']['defense_pair']['strike'],
         'last_candle': ctx.bars[-1].start.isoformat(),
         'scenario': setup.kind,
         't1_hit': False,
@@ -2834,7 +2794,8 @@ def open_position(
     }
     if (
         cfg.arm_continuation_runner
-        and setup.kind in ('OPENING_BREAK', 'TREND_BREAK', 'PULLBACK_RESUMPTION')
+        and setup.kind
+        in ('TREND_BREAK', 'PULLBACK_RESUMPTION', 'PULLBACK_RECLAIM', 'RANGE_RETEST')
         and ctx.move is not None
         and setup.side * ctx.move >= STRONG_MOVE
         and runner_price_support(ctx.threes, setup.side)
@@ -2852,11 +2813,7 @@ def open_position(
         plan=asdict(plan),
         entry_evidence=result['entry_evidence'],
         risk_evidence=assessment.evidence,
-        oi={
-            'window': result['oi'],
-            'confirmation_pair': assessment.evidence['structure_oi'],
-            'rule': assessment.evidence['structure_oi_rule'],
-        },
+        oi={'window': result['oi'], 'entry_and_defense': contract['oi_confirmation']},
     )
     result['alerts_created'].append(new_event(state, 'ENTRY', event, now))
     result.update(
@@ -2991,7 +2948,9 @@ def scan(
         and (now - quote_at).total_seconds() > cfg.quote_max_age_seconds
     ):
         spot = quote_at = None
-    ctx = analyze_price(price.bars, prior_ten, session_open) if price.bars else None
+    ctx = (
+        analyze_price(price.bars, prior_ten, session_open, spot) if price.bars else None
+    )
     grid = listed_strikes(contracts)
     pairs = paired_oi(window)
     band = StrikeBand.build(grid, spot, pairs) if spot is not None else None
@@ -3007,8 +2966,9 @@ def scan(
             'range': [region.low, region.high] if region else None,
             'range_break_not_held_live': region is not None
             and ctx.trading_range is None,
-            'transition': jsonable(asdict(ctx.transition)) if ctx.transition else None,
-            'reversal_watch': ctx.reversal_watch(),
+            'reversal_watch': jsonable(asdict(ctx.rejection))
+            if ctx.rejection
+            else None,
             'close_3m': ctx.threes[-1].close if ctx.threes else None,
             'close_3m_at': bar_end(ctx.threes[-1], 3).isoformat()
             if ctx.threes
@@ -3021,6 +2981,22 @@ def scan(
         }
 
     if active:
+        defense_confirms = None
+        defense_strike = active.get('defense_strike')
+        if defense_strike is not None:
+            if window and window.snapshot.expiry == active['expiry']:
+                entry = pairs.get(
+                    active['strike'], OIPair(active['strike'], None, None)
+                )
+                defense = pairs.get(defense_strike, OIPair(defense_strike, None, None))
+            else:
+                entry = OIPair(active['strike'], None, None)
+                defense = OIPair(defense_strike, None, None)
+            confirmation = StrikeConfirmation.check(
+                entry, defense, 1 if active['side'] == 'CE' else -1, False
+            )
+            result['active_defense_oi'] = confirmation.public()
+            defense_confirms = confirmation.rule is not None
         position, events, closed, warnings = manage_reference(
             active,
             price.bars,
@@ -3038,7 +3014,9 @@ def scan(
             and now < deadline
             and price.covers_entry(expected)
         ):
-            adjustment = refine_reference(position, ctx, spot, band, now)
+            adjustment = refine_reference(
+                position, ctx, spot, band, now, defense_confirms=defense_confirms
+            )
             if adjustment:
                 t1 = next((detail for kind, detail in events if kind == 'T1'), None)
                 if t1:
@@ -3072,7 +3050,7 @@ def scan(
     # Record expired or structurally replaced opportunities. Incomplete data
     # never resolves a price setup before its original deadline.
     enough_price = price.covers_entry(expected) and price.tail_size >= 6
-    ledger = engine.get('v137_setups', {})
+    ledger = engine.get('v137_1_1_setups', {})
     for key, old in ledger.items():
         if old['status'] in TERMINAL_SETUP_STATES:
             continue
@@ -3099,15 +3077,14 @@ def scan(
         )
     if state.get('position'):
         return finish('EXISTING_POSITION_REMAINS_VALID')
-    if ctx.trading_range:
-        return finish('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD')
     if not candidate:
-        reason = (
+        if ctx.trading_range:
+            return finish('INTACT_RANGE_AWAITING_OUTER_BREAK_AND_HOLD')
+        return finish(
             'REVERSAL_WATCH_AWAITING_CONFIRMATION'
-            if ctx.transition or ctx.reversal_watch()
+            if ctx.rejection
             else 'NO_CONFIRMED_NEW_LEG'
         )
-        return finish(reason)
 
     setup = candidate
     last_entry = min(day_time(now, *ENTRY_END), deadline - 10 * MINUTE)
@@ -3116,6 +3093,14 @@ def scan(
         result['setup'] = existing
         return finish(existing['reason'])
     if now > setup.expires_at or now >= last_entry:
+        result['evaluations'].append(
+            {
+                'phase': 'TIMING',
+                'first_break_at': setup.first_break_at.isoformat(),
+                'expires_at': setup.expires_at.isoformat(),
+                'decision_at': now.isoformat(),
+            }
+        )
         return finish(
             'SETUP_EXPIRED' if now > setup.expires_at else 'OUTSIDE_ENTRY_WINDOW',
             'EXPIRED',
@@ -3182,12 +3167,12 @@ def scan(
 
     ranked = []
     result['contract_checks'] = []
-    for offset, pair, row, rule in final.choices:
+    for choice in final.choices:
+        offset, row, confirmation = choice.offset, choice.row, choice.confirmation
         check = {
-            'strike': pair.strike,
+            'strike': confirmation.entry.strike,
             'offset': offset,
-            'oi_rule': rule,
-            'oi_pair': pair.public(),
+            **confirmation.public(),
         }
         result['contract_checks'].append(check)
         try:
@@ -3204,10 +3189,11 @@ def scan(
             check['reason'] = str(exc)
             continue
         check['reason'] = 'QUALIFIED_QUOTE'
-        contract['oi_rule'] = rule
+        contract['oi_rule'] = confirmation.rule
+        contract['oi_confirmation'] = confirmation.public()
         ranked.append(
             (
-                -pair.score(setup.side),
+                -confirmation.score,
                 contract['spread_pct'],
                 -contract['depth_lots'],
                 abs(offset),
@@ -3227,6 +3213,8 @@ def scan(
         'index_quote_at': final_at.isoformat(),
         'index_quote': final_spot,
         'signal_candle_closed_at': setup.confirmed_at.isoformat(),
+        'first_break_at': setup.first_break_at.isoformat(),
+        'live_rejection_confirmation': setup.live_confirmation,
         'option_quote_at': contract['quote_time'],
         'candle_through': ctx.through.isoformat(),
         'oi_snapshot_at': window.snapshot.at.isoformat(),
@@ -3457,6 +3445,7 @@ def environment_config() -> Config:
         'allow_atm_reversal',
         'reversal_strike_stop',
         'max_chase_atr',
+        'max_initial_risk_points',
     ):
         raw.pop(legacy, None)
     # v133 stored these values as defaults in some deployed configurations.
